@@ -61,9 +61,6 @@
 #include "ui_nav.h"
 #include "ui_wifi_qr.h"
 #include "usb_storage.h"
-#if KIIKO_BOARD_METALIO47
-#include "weread.h"
-#endif
 
 // 引导复用网络后端时不登记或绘制主页面底栏。/ Setup reuses networking without root-tab ink or hit registrations.
 static bool s_setup_chrome;
@@ -488,11 +485,6 @@ static app_redraw_t network_ui_tick(app_ctx_t* ctx) {
     if (s_network_connect_pending) {
         s_network_connect_pending = false;
         read_pico_transfer_cfg_t cfg = {.mode = READ_PICO_TRANSFER_MODE_STA, .network_only = true};
-#if KIIKO_BOARD_METALIO47
-        // 射频要重新初始化：先关掉微信读书的长连接，既腾内部 RAM 也避免野 socket。
-        // The radio is about to re-init: close weread keep-alive sockets first, freeing internal RAM and wild handles.
-        wr_http_release();
-#endif
         esp_err_t err = read_pico_transfer_start(&cfg);
         s_session_started = err == ESP_OK;
         read_pico_transfer_get_status(&s_status);
@@ -518,25 +510,12 @@ static app_redraw_t network_ui_tick(app_ctx_t* ctx) {
         return changed ? APP_REDRAW_PAGE : APP_REDRAW_NONE;
     }
     if (!s_scan_pending) return APP_REDRAW_NONE;
-#if KIIKO_BOARD_METALIO47
-    /* 微信读书还在下载时先别起射频：它池里的每条 TLS 连接都要几 KB 内部 RAM，
-     * 而 Wi-Fi 驱动初始化在 75 KB 空闲时都可能分配失败。等任务收尾，下一轮再扫。
-     * Do not arm the radio while weread is downloading: each pooled TLS connection
-     * holds a few KB of internal RAM and Wi-Fi init can fail even at 75 KB free.
-     * Wait for the job to finish and scan on the next tick. */
-    if (wr_network_busy()) return APP_REDRAW_NONE;
-#endif
     s_scan_pending = false;
     s_network_count = s_network_page = 0;
     // The scan notice is already in the framebuffer. Drop rebuildable glyph
     // bitmaps before starting WiFi, then recreate them while drawing the result.
     // This prevents the hosted radio from competing with the UI cache at init.
     ttf_font_cache_clear();
-#if KIIKO_BOARD_METALIO47
-    // 扫描要新建/销毁 Wi-Fi 驱动，必须先把长连接和它们的内部 RAM 还回去。
-    // A scan re-creates the Wi-Fi driver, so release keep-alive sockets and their internal RAM first.
-    wr_http_release();
-#endif
     esp_err_t err = read_pico_transfer_scan_wifi(s_networks, &s_network_count);
     s_scan_error = err;
     if (err != ESP_OK) {
@@ -1092,11 +1071,6 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
                 .wallpaper_set_cb = transfer_set_wallpaper,
                 .signature_get_cb = transfer_signature_get, .signature_set_cb = transfer_signature_set,
                 .title_get_cb = NULL, .title_set_cb = NULL};
-#if KIIKO_BOARD_METALIO47
-            // 热点/传输服务同样会重新拉起射频，先释放长连接。
-            // The AP/transfer service re-arms the radio as well; release keep-alive sockets first.
-            wr_http_release();
-#endif
             err = read_pico_transfer_start(&cfg);
             s_session_started = err == ESP_OK;
             read_pico_transfer_get_status(&s_status);

@@ -1,4 +1,60 @@
+# 更新记录
+
+## 3.0.0（2026-11-18）
+
+- 改为微信读书**分章节缓存**：正文、图片和章节元数据独立保存，阅读时按需下载当前章节。
+- 支持缓存中断后保留已完成章节，并只补齐缺少的章节资源。
+- 统一章节加载卡片和缓存进度展示，保留原生阅读器、字体字号设置及阅读体验。
+- 保留书架/封面同步、账户管理、阅读进度同步和阅读时长上报。
+- 本版本发布包仅包含 16 MiB 全闪存镜像；刷写会覆盖全部闪存并清除设备内配置及状态。
+- 详细说明：[3.0.0 发布说明](RELEASE_3.0.md)、[章节缓存设计](WEREAD_CHAPTER_CACHE_DESIGN.md)。
+
 # 版本变更 / Changelog
+
+## 分章缓存与书架直接阅读（第一阶段）/ Chapter cache and shelf-direct reading (stage 1) — 2026-11-17
+
+- 新增 `book_epub` 条目访问层：把 53 处 `zip_*` 调用收口为 `epub_find/entry_name/entry_size/extract/extract_prefix/entry_count/prefetch`，并增加 `book_epub_open_virtual()`。虚拟书源的命名空间与组装后的 EPUB 完全一致（`c<i>.xhtml` + 扁平图片名），因此排版、分页、字体、书签与进度逻辑一行未改。
+  New entry-access layer in `book_epub`: 53 `zip_*` call sites now go through six helpers, plus `book_epub_open_virtual()`. A virtual source uses the same flat namespace as an assembled EPUB (`c<i>.xhtml` plus bare image names), so layout, pagination, fonts, bookmarks and progress are untouched.
+- 新增 `main/book/weread_cache.{h,c}`：章节存储状态（以 `m/c<N>.meta` 为提交点，磁盘即索引）、自描述标记文件（`WRVBOOK1`）、虚拟书源提供方、读者等待事件。未缓存章节返回占位正文，全书目录在零下载时即完整。
+  Added `weread_cache.{h,c}`: chapter state (the `m/c<N>.meta` file is the commit point; the filesystem is the only index), a self-describing marker (`WRVBOOK1`), the virtual provider and the reader-waiting event. Uncached chapters return placeholder text, so the full TOC exists before the first download.
+- `weread.c` 新增 `WR_PREFETCH` 窗口任务：读者正在等待的章节优先，其次按 10 章窗口补章；单章失败只结束本轮，已完成的章节保留。新增 `wr_open_book()`（写标记并备好目录，不要求整本已缓存）、`wr_prefetch_nudge()`、`wr_read_take_ready()`。
+  `weread.c` gained the `WR_PREFETCH` window job (the chapter the reader waits for wins, then a 10-chapter window; a failure ends only that round), plus `wr_open_book()` (writes the marker and prepares the TOC without requiring a full download), `wr_prefetch_nudge()` and `wr_read_take_ready()`.
+- `app_weread.c`："打开"不再要求整本已缓存，点击即进书；`book_source` 在打开 `.epub` 路径前先询问虚拟解析器，旧缓存书走原 ZIP 分支。阅读页 `rc_tick()` 在等待的章节落盘后原地重排，读者无需退出重进。
+  `app_weread.c`: opening no longer waits for the whole book. `book_source` asks the virtual resolver before opening a `.epub`, and legacy books keep using the ZIP path. The reader's `rc_tick()` re-layouts in place once the awaited chapter lands.
+- 阅读时长上报改为也认标记文件，按章阅读的书不再丢失时长统计。
+  Reading-time reporting now accepts marker files, so chapter-cached books keep their duration statistics.
+- 文档：`docs/WEREAD_CHAPTER_CACHE_REVIEW.md`（源码审查）、`docs/WEREAD_CHAPTER_CACHE_DESIGN.md`（三项验证、架构、限制、实机清单）。
+  Docs: source review and design/verification reports.
+- 未完成：目录缓存状态徽标、手动缓存与清理入口、多设备进度冲突处理。**以上改动仅验证到编译通过，未做主机模拟与实机验证**。
+  Not done yet: per-chapter cache badges in the TOC, manual cache/clear entries, multi-device conflict handling. Everything above is verified only through compilation; no host simulation or device testing yet.
+
+## 构建环境修复 / Build environment fixes — 2026-11-16
+
+- `cmake/board.cmake`：板级覆盖源目录的 include 改用 `COMPILE_OPTIONS` 传正斜杠 `-I`。原实现把 `get_filename_component(... ABSOLUTE ...)` 的原生反斜杠路径写进源文件级 `INCLUDE_DIRECTORIES`，CMake 生成 ninja 时再输出反斜杠，gcc 解析 `@rsp` 把 `\U` `\b` `\s` 当转义符，导致 `lut.h`、`lcd_driver.h`、`render_context.h` 全部找不到。
+  `cmake/board.cmake`: board-overlay include dirs now go through `COMPILE_OPTIONS` with a forward-slash `-I`. The previous source-level `INCLUDE_DIRECTORIES` kept native backslashes, CMake re-emitted them into the ninja response file, and gcc's `@rsp` parser consumed `\U` `\b` `\s` as escapes, so `lut.h`, `lcd_driver.h` and `render_context.h` were all unreachable.
+- 板级 `lcd_driver.c`：`lcd_ll_select_clk_src` / `lcd_ll_set_group_clock_coeff` 首参由 HAL 上下文改为组号（ESP-IDF 6.x 签名），修复 `-Wint-conversion`。
+  Board `lcd_driver.c`: `lcd_ll_select_clk_src` / `lcd_ll_set_group_clock_coeff` now take a group id instead of the HAL context, matching the ESP-IDF 6.x signatures and clearing `-Wint-conversion`.
+- `tools/build_firmware.py` 新增 `--jobs`（或 `KIIKO_BUILD_JOBS`）转发给 `idf.py -j`，用于规避 Windows 上满并发时 `cc1` 偶发永久阻塞、`ninja` 无限等待的问题。
+  `tools/build_firmware.py` gained `--jobs` (or `KIIKO_BUILD_JOBS`) forwarded to `idf.py -j`, working around an occasional Windows hang where a fully parallel `cc1` child blocks forever and `ninja` waits indefinitely.
+- 首次在本机完整构建成功：`0.3.3-rc113`，应用镜像 5,067,696 bytes，SHA-256 `2c98e998cddb315d5a6207f4ea6f62eb23b59aa72f2def0eac78fe01f2560d4c`，OTA 分区余量 19%。`docs/BUILD_METALIO_S31.md` 补充 Windows 四个已知坑。
+  First complete local build: `0.3.3-rc113`, app image 5,067,696 bytes, SHA-256 `2c98e998cddb315d5a6207f4ea6f62eb23b59aa72f2def0eac78fe01f2560d4c`, 19% free in the OTA slot. `docs/BUILD_METALIO_S31.md` now lists the four Windows pitfalls.
+- 新增 `tools/make_full_flash.py`：把一次构建产物拼成 16 MiB 原始闪存镜像（bootloader `0x2000`、分区表 `0x8000`、otadata `0xD000`、应用 `0x10000`，其余 `0xFF`），校验芯片 ID、应用扩展头、分区表魔数与各段越界。本次产物 16,777,216 bytes，SHA-256 `151db03fbb2621d8f59b4e0c95f860c3936828320dbff0a9601f3fdc61aab0a8`；未刷写。
+  Added `tools/make_full_flash.py`, which packs one build into a 16 MiB raw flash image (bootloader `0x2000`, partition table `0x8000`, otadata `0xD000`, app `0x10000`, everything else `0xFF`) and validates chip id, the application extended header, the partition-table magic and region bounds. This build's image is 16,777,216 bytes with SHA-256 `151db03fbb2621d8f59b4e0c95f860c3936828320dbff0a9601f3fdc61aab0a8`; not flashed.
+
+## 微信读书缓存提速 / WeRead cache speedup — 2026-11-16
+
+- 整包响应改走同一条 keep-alive 连接（章节目录、正文分片、封面与插图），连接层失败自动退回一次性连接的原有路径；`keep_alive_idle` 10s → 30s。服务端 gzip 由本地 zlib 解压（IDF 的 http_client 不解压）。日志新增 `connection_reused` 与 `gunzip` 字段用于核验。
+  Complete responses now reuse one keep-alive connection (catalog, chapter shards, cover and inline images) and fall back to the previous one-shot path on any connection-level failure; `keep_alive_idle` is raised to 30 s. gzip bodies are inflated locally with zlib because the IDF http_client does not decompress. `connection_reused` and `gunzip` are logged for verification.
+- 章节目录新增 SD 卡缓存（`/sdcard/.weread/toc/`，7 天 TTL），与原有 10 分钟内存缓存叠加，换书或重启后不再重新拉取。
+  The chapter catalog is cached on SD (`/sdcard/.weread/toc/`, 7-day TTL) on top of the 10-minute memory cache, so switching books or rebooting no longer refetches it.
+- 章节插图优先用 `chapterInfos` 的 `tar` 字段一次取回整章图包（tar，或云转码书籍的 zip），未命中的外链图才逐张下载，并按 URL 全书去重；gif 仍跳过。
+  Chapter illustrations now come from the `tar` field of `chapterInfos` as one bundle per chapter (tar, or zip for cloud-converted books); only unmatched inline images fall back to per-image downloads, deduplicated by URL across the book. gif entries are still skipped.
+- 缓存改为「按章暂存 + 断点续传」：正文与插图写入 `/sdcard/.weread/stage-<账号>-<书籍>/`，每章写完正文再写 meta（uid、字节数、CRC32）；任何一章失败只丢该章，下次缓存校验后从缺口继续，全部就绪才组装 EPUB。
+  Caching is now staged per chapter with resume: text and images land in `/sdcard/.weread/stage-<account>-<book>/`, and each chapter writes its body before a meta record (uid, byte count, CRC32). A failed chapter only loses itself, the next run verifies and resumes at the gap, and the EPUB is assembled only once everything is ready.
+- 章节 XHTML 直接在 PSRAM 组装后写入暂存文件，去掉了 `chapter.part` 的落盘与回读。
+  Chapter XHTML is assembled in PSRAM and written straight to the staging file, removing the `chapter.part` write-then-read-back round trip.
+- `docs/WEREAD_ARCHITECTURE.md` 同步更新缓存流程与本地数据说明，删除已不在代码中的并发预取描述。
+  `docs/WEREAD_ARCHITECTURE.md` now documents the new cache flow and on-device layout, and drops the concurrent-prefetch description that no longer exists in code.
 
 ## 最终源码与缓存验证 / Final source and cache verification — 2026-11-16
 

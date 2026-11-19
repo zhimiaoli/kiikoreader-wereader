@@ -96,13 +96,19 @@ static bool field(const char *html, const char *key, char *out, size_t cap) {
 
 typedef struct {
     wr_reader_t *reader;
-    char window[512 + 2048 + 1];
+    /* 尾部 512 字节用于跨块的键名接续，正文区按一次读满一整块来开。 */
+    /* The trailing 512 bytes carry a key split across two reads; the body part fits one full
+     * read unit. */
+    char window[512 + WR_FIELD_CHUNK + 1];
     size_t tail;
 } reader_scan_t;
 
 static bool reader_fields_chunk(const char *data, size_t length, void *context) {
     reader_scan_t *scan = context;
     wr_reader_t *reader = scan->reader;
+    // 契约外的块长直接拒绝：宁可少一次解析，也不能把调用方的缓冲写穿。
+    // Reject out-of-contract lengths: a missed parse is better than writing past the buffer.
+    if (length > WR_FIELD_CHUNK) return false;
     memcpy(scan->window + scan->tail, data, length);
     size_t size = scan->tail + length;
     scan->window[size] = 0;
@@ -118,6 +124,13 @@ static bool reader_fields_chunk(const char *data, size_t length, void *context) 
     return false;
 }
 
+bool wr_reader_referer_for(const char *book, const char *chapter, char *out, size_t cap) {
+    char b[128], c[128];
+    if (!out || !cap || !encode_id(book, b) || !encode_id(chapter, c)) return false;
+    int n = snprintf(out, cap, WR_HOST "/web/reader/%sk%s", b, c);
+    return n > 0 && (size_t)n < cap;
+}
+
 bool wr_reader(const char *book, const char *chapter, wr_reader_t *reader) {
     char b[128], c[128];
     if (!encode_id(book, b) || !encode_id(chapter, c)) return false;
@@ -130,35 +143,6 @@ bool wr_reader(const char *book, const char *chapter, wr_reader_t *reader) {
                                     reader_fields_chunk, scan) && reader->ps[0];
     free(scan);
     return ok;
-}
-
-/* psvts 本身就是 _e(时间戳)，协议只要求 ps 与 pc=_e(ct) 不相等。合成一个稍早的
- * 时间戳就能直接发章节请求，省掉每章一次约 170 KB 的 reader 页下载。
- * psvts is just _e(timestamp) and the protocol only needs ps != pc = _e(ct). A
- * synthesized earlier timestamp skips the ~170 KB reader page once per chapter. */
-bool wr_reader_synthetic(const char *book, const char *chapter, wr_reader_t *reader) {
-    char b[128], c[128], epoch[24];
-    memset(reader, 0, sizeof(*reader));
-    if (!encode_id(book, b) || !encode_id(chapter, c)) return false;
-    snprintf(reader->referer, sizeof(reader->referer), WR_HOST "/web/reader/%sk%s", b, c);
-    unsigned now = (unsigned)time(NULL);
-    if (now < 1704067200) return false;
-    snprintf(epoch, sizeof(epoch), "%u", now - 600u);
-    return encode_id(epoch, reader->ps);
-}
-
-/* 真实 reader 页拿到的 ps 只要服务端不跟章节绑定，就能给同一本书后面的章节复用，
- * 每章省掉一次约 40 KB、1 秒的 reader 页。referer 仍按当前章节重建。
- * A real ps taken from the reader page can be reused for later chapters of the same
- * book, skipping the per-chapter reader page; the referer is rebuilt per chapter. */
-bool wr_reader_from_ps(const char *book, const char *chapter, const char *ps, wr_reader_t *reader) {
-    char b[128], c[128];
-    if (!book || !chapter || !ps || !ps[0]) return false;
-    memset(reader, 0, sizeof(*reader));
-    if (!encode_id(book, b) || !encode_id(chapter, c)) return false;
-    snprintf(reader->referer, sizeof(reader->referer), WR_HOST "/web/reader/%sk%s", b, c);
-    snprintf(reader->ps, sizeof(reader->ps), "%s", ps);
-    return true;
 }
 
 static bool content_body(const char *book, const char *chapter, const wr_reader_t *reader, char out[1000]) {
@@ -185,28 +169,6 @@ static bool shard_valid(const char *body, size_t length) {
     char hash[33];
     md5(body+32, length-32, hash);
     return !strncasecmp(hash, body, 32);
-}
-
-/* 分片被拒时把响应体打出来。服务端拒绝一章时回的是几十字节的 JSON（限流、下架、
- * 会话失效都会走这条路），而日志原来只有 Content-Length，分不出是哪一种。
- * 只打可打印 ASCII，二进制字节换成点，长度上限 200，避免把大响应刷进日志。
- * Dump a rejected body: a refusal is a few dozen bytes of JSON, and the log only carried
- * Content-Length, which cannot tell throttling from a delisted chapter. Printable ASCII only. */
-static void shard_reject(const char *endpoint, const char *body, size_t length) {
-    if (!body) {
-        ESP_LOGW("WEREAD", "shard reject endpoint=%s bytes=%u body=<null>",
-                 endpoint, (unsigned)length);
-        return;
-    }
-    char text[201];
-    size_t used = length < 200 ? length : 200;
-    for (size_t i = 0; i < used; ++i) {
-        unsigned char c = (unsigned char)body[i];
-        text[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
-    }
-    text[used] = 0;
-    ESP_LOGW("WEREAD", "shard reject endpoint=%s bytes=%u body=%s",
-             endpoint, (unsigned)length, text);
 }
 
 static bool restore_order(char *data, size_t size) {
@@ -280,27 +242,17 @@ char *wr_chapter_content(const char *book, const char *chapter, const wr_reader_
     const char *const *endpoints = *plain ? text : epub;
     unsigned shards = *plain ? 2 : 3;
     if (*plain) { free(data); data = wr_http(text[0], json, reader->referer, limit, &n); }
-    if (!shard_valid(data, n)) {
-        shard_reject(endpoints[0], data, n);
-        free(data);
-        return NULL;
-    }
+    if (!shard_valid(data, n)) { free(data); return NULL; }
     size_t used = n-33;
     memmove(data, data+33, used);
     for (unsigned i = 1; i < shards; ++i) {
-        /* wr_http 失败时不写长度，用局部变量接，别让上一个分片的 n 冒充本次长度。
-         * wr_http leaves the length untouched on failure, so take a local so the previous
-         * shard's count cannot stand in for this one. */
-        size_t shard_bytes = 0;
-        char *shard = wr_http(endpoints[i], json, reader->referer, limit, &shard_bytes);
-        const bool shard_ok = shard_valid(shard, shard_bytes);
-        if (!shard_ok) shard_reject(endpoints[i], shard, shard_bytes);
-        char *grown = shard_ok && shard_bytes-32 <= limit-used
-            ? heap_caps_realloc(data, used+shard_bytes-31, MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT) : NULL;
+        char *shard = wr_http(endpoints[i], json, reader->referer, limit, &n);
+        bool valid = shard_valid(shard, n) && n-32 <= limit-used;
+        char *grown = valid ? heap_caps_realloc(data, used+n-31, MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT) : NULL;
         if (!grown) { free(shard); free(data); return NULL; }
         data = grown;
-        memcpy(data+used, shard+32, shard_bytes-32);
-        used += shard_bytes-32;
+        memcpy(data+used, shard+32, n-32);
+        used += n-32;
         free(shard);
     }
     if (!restore_order(data, used) || !(*length = decode_base64(data, used))) { free(data); return NULL; }
@@ -318,8 +270,9 @@ static bool unsigned_field(const cJSON *object, const char *key, unsigned *value
 }
 
 bool wr_remote_position_with_chapters(const char *id, wr_chapter_t *chapter, unsigned *offset, unsigned *pct,
-                                      const wr_chapter_t *known_chapters, unsigned known_count) {
+                                      const wr_chapter_t *known_chapters, unsigned known_count, bool *absent) {
     char path[120];
+    if (absent) *absent = false;
     if (!wr_safe(id)) return false;
     snprintf(path, sizeof(path), "/web/book/getProgress?bookId=%s", id);
     cJSON *response = wr_json(path, NULL);
@@ -365,6 +318,9 @@ bool wr_remote_position_with_chapters(const char *id, wr_chapter_t *chapter, uns
         if (!err) err = cJSON_GetObjectItemCaseSensitive(response, "errcode");
         ESP_LOGW("WEREAD", "cloud progress fields unavailable root_type=%d data_type=%d book_type=%d err_type=%d",
                  response->type, root ? root->type : 0, book ? book->type : 0, err ? err->type : 0);
+        // 请求拿到了应答、只是里面没有进度字段：这是"云端还没有读这本书"，不是网络故障。
+        // A parsed response without the fields means the book was never read, not a failure.
+        if (absent) *absent = true;
         if (!wr_error_message() || !strcmp(wr_error_message(), "操作失败，请检查网络后重试"))
             wr_error_set("微信读书云端尚无可用阅读进度或进度数据格式已变化");
     }
@@ -373,7 +329,7 @@ bool wr_remote_position_with_chapters(const char *id, wr_chapter_t *chapter, uns
 }
 
 bool wr_remote_position(const char *id, wr_chapter_t *chapter, unsigned *offset, unsigned *pct) {
-    return wr_remote_position_with_chapters(id, chapter, offset, pct, NULL, 0);
+    return wr_remote_position_with_chapters(id, chapter, offset, pct, NULL, 0, NULL);
 }
 
 static void web_app_id(char id[40]) {

@@ -12,3 +12,8 @@ void app_time_service_request_online_sync(void);
 /// 请求/交接未完成时允许引导缩短界面空闲等待，其余资源门禁保持。
 /// Let setup shorten UI-idle admission while a request/handoff is pending; preserve resource guards.
 bool app_time_service_online_sync_pending(void);
+
+/// 距上次成功校准是否已超过 min_seconds；供"联网时顺手对时"判断要不要再校一次。
+/// Whether min_seconds have passed since the last successful calibration, for the
+/// "sync while already online" path.
+bool app_time_service_sync_due(uint32_t min_seconds);

@@ -42,21 +42,41 @@ void app_time_service_request_online_sync(void){
 }
 bool app_time_service_online_sync_pending(void){return s_online_pending;}
 
+/* 读出上次成功校准的时刻（NVS）。s_loaded 之后不再重复读。
+ * Load the last successful calibration stamp; after s_loaded it is not read again. */
+static void clock_load_last_sync(void) {
+    if (s_loaded) return;
+    nvs_handle_t handle = 0;
+#if KIIKO_BOARD_METALIO47
+    if (nvs_open("mt_clock", NVS_READONLY, &handle) == ESP_OK) {
+#else
+    if (nvs_open("kiiko_clock", NVS_READONLY, &handle) == ESP_OK) {
+#endif
+        if (nvs_get_u64(handle, "last_ntp", &s_last_sync) != ESP_OK) s_last_sync = 0;
+        nvs_close(handle);
+    }
+    if (s_last_sync < CLOCK_VALID_MIN || s_last_sync > CLOCK_VALID_MAX) s_last_sync = 0;
+    s_loaded = true;
+}
+
+/*
+ * 距离上次成功校准是否已经超过 min_seconds。给"联网时顺手对时"用：读者正在微读里下载，
+ * STA 连接本来就在，此时校一次时不需要另起 Wi-Fi，也不占额外内存。
+ * Whether min_seconds have passed since the last successful calibration. Used by the
+ * "sync while already online" path: the STA link is up for the reader's downloads, so
+ * calibrating costs no extra Wi-Fi bring-up and no extra buffers.
+ */
+bool app_time_service_sync_due(uint32_t min_seconds) {
+    clock_load_last_sync();
+    if (!s_last_sync) return true;
+    time_t now = time(NULL);
+    if (now >= (time_t)s_last_sync) return (uint64_t)(now - (time_t)s_last_sync) >= min_seconds;
+    return true; /* 时钟被回拨过，当作需要校准。/ Clock moved backwards: treat as due. */
+}
+
 void app_time_service_poll(bool idle) {
     if (!idle) return;
-    if (!s_loaded) {
-        nvs_handle_t handle;
-#if KIIKO_BOARD_METALIO47
-        if (nvs_open("mt_clock", NVS_READONLY, &handle) == ESP_OK) {
-#else
-        if (nvs_open("kiiko_clock", NVS_READONLY, &handle) == ESP_OK) {
-#endif
-            if (nvs_get_u64(handle, "last_ntp", &s_last_sync) != ESP_OK) s_last_sync = 0;
-            nvs_close(handle);
-        }
-        if (s_last_sync < CLOCK_VALID_MIN || s_last_sync > CLOCK_VALID_MAX) s_last_sync = 0;
-        s_loaded = true;
-    }
+    clock_load_last_sync();
     uint32_t received;
     if (read_pico_transfer_take_time_sync(&received)) {
         // 只有真实网络成功才持久化；普通重启/手动设时间不能伪装成网络校准。

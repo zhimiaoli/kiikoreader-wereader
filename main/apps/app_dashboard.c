@@ -378,6 +378,35 @@ static bool s_cover_waiting;
 static bool load_cover(home_book_t *item,int slot) {
     s_cover_waiting=false;
     if(!pico_boot_asset_allowed(item->path))return false;
+    /*
+     * 逐章缓存的微读书只有一个标记文件，封面是书旁的灰阶快照。直接读：40 KB 顺序读，
+     * 几毫秒就有结果；走后台解码队列则要排队、要等内存宽裕，首页那块就一直空着。
+     * Chapter-cached books are a marker file plus a grayscale snapshot beside them. Read it
+     * directly: 40 KB sequential, a few milliseconds. The decode queue has to be scheduled
+     * first, which left the home card blank.
+     */
+    if(!item->cover) {
+        uint8_t *side=heap_caps_malloc(BOOK_COVER_W*BOOK_COVER_H,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+        if(side) {
+            if(book_cover_sidecar_gray(item->path,side)) {
+                home_cover_cache_t *cached=&s_cover_cache[slot];
+                free(cached->pixels);
+                memset(cached,0,sizeof(*cached));
+                snprintf(cached->path,sizeof(cached->path),"%s",item->path);
+                snprintf(cached->title,sizeof(cached->title),"%s",item->title);
+                snprintf(cached->author,sizeof(cached->author),"%s",item->author);
+                struct stat st;
+                if(!stat(item->path,&st)) {cached->size=st.st_size;cached->modified=st.st_mtime;}
+                cached->pixels=side;cached->fast=false;
+                cached->width=BOOK_COVER_W;cached->height=BOOK_COVER_H;
+                item->cover=side;item->cover_fast=false;
+                item->cover_width=BOOK_COVER_W;item->cover_height=BOOK_COVER_H;
+                s_cover_retry_ms=0;
+                return true;
+            }
+            free(side);
+        }
+    }
     book_cover_job_t request={.list=true,.natural=true,.fast=app_settings_main_fast_refresh(),
         .contrast=app_settings_system_contrast(),.phase=17};
     snprintf(request.path,sizeof(request.path),"%s",item->path);

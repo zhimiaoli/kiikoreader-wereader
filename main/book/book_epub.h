@@ -16,8 +16,42 @@
 #include "html_text.h"
 
 typedef struct book_epub book_epub_t;
+
+/*
+ * 虚拟书源：让阅读器读取"尚未组装成单个 ZIP"的整书。
+ *
+ * 命名空间与组装后的 EPUB 完全一致（扁平）：章节 `c<i>.xhtml`，插图 `<名称>.<扩展名>`。
+ * 因此排版、分页、字体、书签、进度等原生逻辑无需感知数据来源；只有 ZIP 条目访问被替换。
+ * 条目索引必须稳定，打开书籍时一次性枚举，之后不再变化。
+ *
+ * Virtual source: read a whole book that is not yet assembled into one ZIP. The entry
+ * namespace matches the assembled EPUB exactly (flat: `c<i>.xhtml` plus image names), so the
+ * layout, pagination, font, bookmark and progress logic is untouched; only ZIP entry access
+ * is replaced. Entry indices must be stable for the lifetime of the open book: chapters are
+ * enumerated once, then images may be appended (never reordered) as chapters land.
+ */
+typedef struct {
+    void *ctx; ///< 提供方上下文 / Provider context
+    size_t entries; ///< 打开时的条目总数 / Entries at open time
+    size_t chapters; ///< spine 章节数 / Spine chapter count
+    const char *(*entry_name)(void *ctx, size_t index); ///< 条目名，NULL 视为无效 / Entry name, NULL invalid
+    size_t (*entry_size)(void *ctx, size_t index); ///< 解压后字节数 / Uncompressed size
+    esp_err_t (*entry_read)(void *ctx, size_t index, void *dst, size_t cap); ///< 整条读取 / Read whole entry
+    esp_err_t (*entry_read_prefix)(void *ctx, size_t index, void *dst, size_t cap); ///< 只读前缀 / Read a prefix only
+    esp_err_t (*chapter_title)(void *ctx, size_t index, char *buf, size_t cap); ///< 目录标题 / Chapter title
+    void (*release)(void *ctx); ///< 关闭书时释放上下文，可为 NULL / Free ctx on close, may be NULL
+    /// 实时条目总数（可为 NULL，退回 `entries`）：插图落盘后会增长，查找必须看到它们。
+    /// 追加在末尾，不改变既有成员偏移。/ Appended at the end so existing member offsets hold.
+    /// Live entry count (may be NULL, then `entries` stands): images grow the set after open, and
+    /// lookups have to see them.
+    size_t (*entry_count)(void *ctx);
+} book_epub_virtual_t;
+
 /// 打开 EPUB；失败时 out 置空，成功后由 close 释放。/ Open EPUB; clear out on failure, close owns successful cleanup.
 esp_err_t book_epub_open(const char *path, book_epub_t **out);
+/// 以虚拟书源打开；失败时 out 置空。src 内容被复制，src 本身不必长期存在。
+/// Open through a virtual source; clear out on failure. src is copied, so src need not outlive the call.
+esp_err_t book_epub_open_virtual(const book_epub_virtual_t *src, book_epub_t **out);
 /// 关闭 ZIP 并释放目录，可传 NULL。/ Close ZIP and free the index; NULL is allowed.
 void book_epub_close(book_epub_t *book);
 /// 是否使用书内自带字体（CSS @font-face 或包内 TTF）；默认开启。关掉后正文回到系统字体，

@@ -148,6 +148,182 @@ static app_redraw_t rc_panel_action(app_ctx_t*ctx,int x,int y,bool*handled){
     return APP_REDRAW_NONE;
 }
 static app_redraw_t rc_tick(app_ctx_t*ctx){
+    /*
+     * 逐章缓存的两条等待线：首开等本章落盘、目录里点了未缓存的章。
+     * 只读本地状态，300 ms 轮询一次，且只在进度真的变化时重绘——墨水屏上无谓的重绘
+     * 比不刷新更伤阅读。两条线都在 body 判定之前，因为等待时页面本身不是可翻的正文。
+     * Chapter-cache waits: the first-open chapter and a chapter tapped in the TOC. Poll local
+     * state every 300 ms and repaint only on real progress; needless refreshes read worse than
+     * none. Both run before the body gate, since a waiting page is not turnable text.
+     */
+    if (s_warm_chapter >= 0 || s_toc_download >= 0) {
+        const bool due = ctx->now_ms >= s_cache_poll_ms;
+        /*
+         * 首开未缓存的书：后台在第一次下载之前会先问一次云端进度，结果可能把等待的章节
+         * 整个换掉（手机上读到第几十章，本地却在等第一章）。这里只做"换目标"，不发起请求；
+         * 换完重新计时，卡片上的章号与偏移随之更新。
+         * First open with nothing cached: the background asks the cloud once before its first
+         * download, and the answer may move the awaited chapter far ahead of chapter one. This
+         * only re-targets the wait — it never issues a request — and restarts the timers so the
+         * card's chapter number and offset follow.
+         */
+        wr_seed_t seed = WR_SEED_IDLE;
+        if (s_warm_chapter >= 0 && s_warm_enter && due) {
+            s_cache_poll_ms = ctx->now_ms + 300;
+            unsigned seed_chapter = 0, seed_offset = 0;
+            seed = wr_cloud_seed_state(&seed_chapter, &seed_offset);
+            if (seed == WR_SEED_FOUND) {
+                wr_cloud_seed_ack();
+                if (seed_chapter != (unsigned)s_warm_chapter &&
+                    seed_chapter < book_chapter_count()) {
+                    s_warm_chapter = (int)seed_chapter;
+                    s_warm_offset = seed_offset;
+                    s_warm_failed = false;
+                    s_warm_start_ms = ctx->now_ms;
+                    s_cache_poll_ms = 0;
+                    s_cache_shown_done = s_cache_shown_percent = 0;
+                    (void)book_chapter_cache_request(seed_chapter);
+                    return APP_REDRAW_PAGE;
+                }
+            } else if (seed == WR_SEED_ABSENT) {
+                wr_cloud_seed_ack();
+                return APP_REDRAW_PAGE;
+            } else if (seed == WR_SEED_PENDING && ctx->now_ms - s_warm_start_ms > 10000) {
+                // 十秒还没结果（弱网/服务端慢）：不再等云端，按当前章节继续。
+                // Ten seconds without an answer (weak link): stop waiting and keep this chapter.
+                wr_cloud_seed_ack();
+                s_warm_start_ms = ctx->now_ms;
+                (void)book_chapter_cache_request((size_t)s_warm_chapter);
+                return APP_REDRAW_PAGE;
+            }
+        }
+        if (s_warm_chapter >= 0) {
+            const size_t chapter = (size_t)s_warm_chapter;
+            if (book_chapter_cache_state(chapter) == BOOK_CH_CACHE_READY) {
+                if (wr_virtual_refresh((unsigned)chapter)) {
+                    s_warm_chapter = -1;
+                    /*
+                     * 进正文前把面板与挂起的手势清干净：等待页期间它们既不显示也不该生效，
+                     * 带进正文只会让底部工具栏凭空出现，或者拿等待页的坐标翻一页。
+                     * Clear panel and pending-tap state before the text appears: neither is
+                     * visible or meaningful on the waiting page, and carrying them over pops the
+                     * tool rail open or turns a page with coordinates from the card.
+                     */
+                    s_reader_panel = READER_PANEL_NONE;
+                    s_reader_tap.pending = false;
+                    /*
+                     * 落盘后一律进正文：翻页等来的章也一样，读者不必再翻一次。
+                     * 落点按方向定：往后翻进章首；往回翻进本章最后一页（读者想看的是这一章的
+                     * 结尾）；云端进度则带着进场时记下的偏移，落到手机上停下的那一句。
+                     * Always enter the text once the chapter lands, including one awaited by a
+                     * turn; the reader never flips twice. The landing spot follows the direction:
+                     * forward to the chapter start, backward to its last page, a cloud position to
+                     * the offset captured on entry.
+                     */
+                    const bool to_end = s_warm_direction < 0 && s_warm_offset == 0;
+                    if (load_chapter(ctx, chapter, s_warm_offset, to_end)) return paint_reading(ctx, MODE_GL16);
+                    return APP_REDRAW_PAGE;
+                }
+            } else if (due) {
+                s_cache_poll_ms = ctx->now_ms + 300;
+                unsigned done = 0, total = 0, percent = 0;
+                (void)book_chapter_cache_progress(&done, &total, &percent);
+                /*
+                 * 任务已经不在跑、这一章却仍没落地，多半是断网或服务端拒绝。
+                 * 六秒后把提示改成"未完成"，免得等待页看起来像卡死。
+                 * No job is running yet the chapter never landed: usually offline or refused.
+                 * After six seconds say so instead of looking hung.
+                 */
+                if (seed != WR_SEED_PENDING && ctx->now_ms - s_warm_start_ms > 6000 &&
+                    wr_status(NULL, 0, NULL, NULL) != WR_BUSY) {
+                    /*
+                     * 任务已经不在跑、这一章却没落地：断网或被服务端拒绝。以前这里只把卡片
+                     * 改成"未完成"就撒手，网络恢复后读者还得自己退出重进——缓存看着就像坏了。
+                     * 现在按 8 秒退避重排，四次用尽才让读者退出。
+                     * The job is gone yet the chapter never landed: offline or refused. This used
+                     * to just relabel the card and stop, so a link that came back still required
+                     * leaving and re-entering — the cache looked broken. Re-queue with an 8 s
+                     * backoff, four times, before suggesting the reader leave.
+                     */
+                    const bool retry = s_warm_retries < 4 && ctx->now_ms >= s_warm_retry_ms;
+                    if (retry) {
+                        ++s_warm_retries;
+                        s_warm_retry_ms = ctx->now_ms + 8000;
+                        (void)book_chapter_cache_request(chapter);
+                    }
+                    if (!s_warm_failed || retry) {
+                        s_warm_failed = true;
+                        return APP_REDRAW_PAGE;
+                    }
+                }
+                if (done != s_cache_shown_done || percent != s_cache_shown_percent) {
+                    s_cache_shown_done = done;
+                    s_cache_shown_percent = percent;
+                    return APP_REDRAW_PAGE;
+                }
+            }
+        }
+        if (s_toc_download >= 0 && due) {
+            s_cache_poll_ms = ctx->now_ms + 300;
+            const book_ch_cache_t state = book_chapter_cache_state(s_toc_download_chapter);
+            if (state == BOOK_CH_CACHE_READY) {
+                const int target = s_toc_download;
+                s_toc_download = -1;
+                s_message[0] = 0;
+                (void)wr_virtual_refresh((unsigned)s_toc_download_chapter);
+                if (toc_open_target(ctx, target)) return APP_REDRAW_PAGE;
+            } else if (state == BOOK_CH_CACHE_FAILED ||
+                       (ctx->now_ms - s_toc_download_ms > 6000 &&
+                        wr_status(NULL, 0, NULL, NULL) != WR_BUSY)) {
+                /*
+                 * 失败有两种：磁盘校验不符（FAILED），或任务已经结束却没落地（多半断网）。
+                 * 都收回到"可重试"，否则目录会一直停在"正在下载"。
+                 * Failures come in two shapes: verification mismatch, or the job ended without
+                 * landing the chapter (usually offline). Both return to a retryable state.
+                 */
+                s_toc_download = -1;
+                copy_text(s_message, sizeof(s_message), "本章缓存失败，可再点一次重试");
+                return APP_REDRAW_PAGE;
+            }
+        }
+        if (s_warm_chapter >= 0 || s_toc_download >= 0) return APP_REDRAW_NONE;
+    }
+    /*
+     * 阅读中持续把"下一章"排上。进入章节时那次提醒可能正撞上 worker 在跑别的任务而被吞掉，
+     * 而窗口任务一旦收尾就没有人再提醒——读者翻到下一章才发现它还没缓存，只能当场等。
+     * 这里每五秒补一次（缓存层自己去重），保证往前翻时下一章通常已经在盘上。
+     * Keep queueing the next chapter while reading. The nudge taken on chapter entry can collide
+     * with another job on the worker and be dropped, and once the window job ends nobody asks
+     * again — the reader only finds out on the turn, and waits there. Re-queue every five seconds
+     * (the cache layer dedupes) so the next chapter is usually already on disk.
+     */
+    if (s_view == READING && s_text && s_reader_panel == READER_PANEL_NONE && wr_online() &&
+        ctx->now_ms >= s_next_prefetch_ms) {
+        s_next_prefetch_ms = ctx->now_ms + 5000;
+        if (s_chapter + 1 < book_chapter_count() &&
+            book_chapter_cache_state(s_chapter + 1) != BOOK_CH_CACHE_READY)
+            (void)book_chapter_cache_request(s_chapter + 1);
+    }
+    /*
+     * 目录里"下载中 → 已缓存"的徽标切换：只看落盘计数变没变，变了重画一次。
+     * 没有这一步，读者停在目录上等，章节下完了也只能看到"下载中"，必须退出重进。
+     * TOC badges going from "下载中" to "已缓存": repaint once whenever the landed-chapter
+     * counter moves. Without it a reader sitting on the TOC never sees the change.
+     */
+    if (s_view == TOC) {
+        const unsigned epoch = book_chapter_cache_epoch();
+        if (!s_toc_cache_seen) {
+            s_toc_cache_seen = true;
+            s_toc_cache_epoch = epoch;
+            return APP_REDRAW_NONE;
+        }
+        if (epoch != s_toc_cache_epoch) {
+            s_toc_cache_epoch = epoch;
+            return APP_REDRAW_PAGE;
+        }
+        return APP_REDRAW_NONE;
+    }
+    s_toc_cache_seen = false;
     bool body=s_view==READING&&s_text&&!s_scan_pending&&!s_clear_confirm&&
         (s_reader_panel==READER_PANEL_NONE||s_reader_panel==READER_PANEL_TOOLS)&&s_footnote_note<0&&!rc_zoom_active()&&!s_reader_tap.pending&&!ctx->consumed&&!ctx->request_app&&!ctx->request_menu&&!ctx->request_return;
     if(!body){
@@ -166,6 +342,19 @@ static app_redraw_t rc_tick(app_ctx_t*ctx){
         if(s_view!=READING||!s_text||(chapter==s_chapter&&page==s_page))rc_stop_auto();
         else ctx->user_activity=true;
         return redraw;
+    }
+    /*
+     * 分章缓存续读：刚打开的书可能只有占位正文，后台把这一章取回后由这里原地重排，
+     * 读者不需要退出重进。先记住当前页在章节内的起始偏移，重排后落回同一段文字。
+     * Chapter-cache handoff: a freshly opened book may show placeholder text; once the
+     * background fetch lands this chapter, re-layout in place at the same source offset so the
+     * reader never has to leave and re-enter the book.
+     */
+    int landed=wr_read_take_ready();
+    if(landed>=0&&(size_t)landed==s_chapter&&s_text){
+        size_t keep=book_layout_page_start_offset(s_page);
+        if(wr_virtual_refresh((unsigned)landed)&&load_chapter(ctx,s_chapter,keep,false))
+            return paint_reading(ctx,MODE_DU);
     }
     return APP_REDRAW_NONE;
 }

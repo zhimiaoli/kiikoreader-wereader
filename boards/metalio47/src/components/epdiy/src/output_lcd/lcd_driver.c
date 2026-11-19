@@ -843,7 +843,9 @@ static esp_err_t init_lcd_peripheral() {
     lcd_ll_enable_trans_buffer(lcd.hal.dev, true);
     esp_clk_tree_enable_src((soc_module_clk_t)LCD_CLK_SRC_DEFAULT, true);
     PERIPH_RCC_ATOMIC() {
-        lcd_ll_select_clk_src(lcd.hal.dev, LCD_CLK_SRC_DEFAULT);
+        // 中文：IDF 6.x 起 lcd_ll_select_clk_src 的参数从 HAL 上下文改成组号。
+        // English: since IDF 6.x lcd_ll_select_clk_src takes a group id, not the HAL context.
+        lcd_ll_select_clk_src(0, LCD_CLK_SRC_DEFAULT);
     }
 #else
     // enable APB to access LCD registers
@@ -853,9 +855,9 @@ static esp_err_t init_lcd_peripheral() {
     lcd_hal_init(&lcd.hal, 0);
     lcd_ll_enable_clock(lcd.hal.dev, true);
 #if defined(LCD_CLK_SRC_PLL240M)
-    lcd_ll_select_clk_src(lcd.hal.dev, LCD_CLK_SRC_PLL240M);
+    lcd_ll_select_clk_src(0, LCD_CLK_SRC_PLL240M);
 #else
-    lcd_ll_select_clk_src(lcd.hal.dev, LCD_CLK_SRC_DEFAULT);
+    lcd_ll_select_clk_src(0, LCD_CLK_SRC_DEFAULT);
 #endif
 #endif
     ESP_RETURN_ON_ERROR(ret, TAG, "set source clock failed");
@@ -1039,8 +1041,10 @@ void epd_lcd_set_pixel_clock_MHz(int frequency) {
 #endif
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
     PERIPH_RCC_ATOMIC() {
+        // 中文：IDF 6.x 起 first 参数为组号而非 HAL 上下文。
+        // English: IDF 6.x takes a group id here instead of the HAL context.
         lcd_ll_set_group_clock_coeff(
-            lcd.hal.dev, (int)clk_div.integer, (int)clk_div.denominator, (int)clk_div.numerator
+            0, (int)clk_div.integer, (int)clk_div.denominator, (int)clk_div.numerator
         );
     }
     // HAL 只写了 HP 分频。LCD 寄存器里 clk_en 默认 0（时钟门关闭），

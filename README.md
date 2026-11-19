@@ -19,7 +19,7 @@ English: [README.en.md](README.en.md)
 
 源码索引见 [`docs/SOURCE_LAYOUT.md`](docs/SOURCE_LAYOUT.md)，微信读书模块边界和数据流见 [`docs/WEREAD_ARCHITECTURE.md`](docs/WEREAD_ARCHITECTURE.md)，S31 构建方法见 [`docs/BUILD_METALIO_S31.md`](docs/BUILD_METALIO_S31.md)。
 
-最新源码变更与设备缓存验证结果见 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)。2026-11-16 在 Metalio S31 上完成一本 32 章书籍缓存复测：所有章节完成，58 张远程图片成功下载，1 个相对路径引用被安全过滤。
+当前源码为 **3.0.0**。本版改为分章节按需缓存，支持中断续传；更新内容见 [`docs/RELEASE_3.0.md`](docs/RELEASE_3.0.md) 与 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)。
 
 需要 ESP-IDF **v6.1**。在 ESP-IDF 环境中，从仓库根目录构建：
 

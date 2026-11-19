@@ -144,12 +144,23 @@ static bool parse_credentials(const char *body, size_t length, transfer_credenti
 }
 
 typedef struct {
-    bool online, pending, failed; ///< 在线、待连接与终止状态 / Online, pending and terminal states
+    bool online, pending, failed; ///< 在线、待连接与"本轮已放弃" / Online, pending, round given up
     unsigned attempts; ///< 本轮尝试次数 / Attempts in this round
+    unsigned rounds;   ///< 已放弃的轮数，决定退避档位 / Rounds given up so far, picks the backoff step
     int64_t deadline_ms, next_ms; ///< 总截止与下次尝试时刻 / Overall deadline and next attempt time
+    int64_t retry_ms;  ///< 下一轮重连的起点 / When the next round may begin
 } transfer_connection_t;
 
 static void connection_begin(transfer_connection_t *c, int64_t now) {
+    // 退避档位跨轮保留：每轮都从零开始就等于永不退避。 / Keep the backoff step across rounds.
+    const unsigned rounds = c->rounds;
+    *c = (transfer_connection_t){.pending = true, .deadline_ms = now + 30000, .next_ms = now,
+                                 .rounds = rounds};
+}
+
+/* 用户重新开启 Wi-Fi 这类"从头再来"用这个：退避档位与失败态一并清掉。 */
+/* For a deliberate restart such as re-enabling Wi-Fi: clear the failure latch and the backoff. */
+static void connection_reset(transfer_connection_t *c, int64_t now) {
     *c = (transfer_connection_t){.pending = true, .deadline_ms = now + 30000, .next_ms = now};
 }
 
@@ -159,11 +170,36 @@ static void connection_lost(transfer_connection_t *c, int64_t now) {
     c->online = false; c->pending = true; c->next_ms = now + 1000;
 }
 
-// 0等待、1连接、-1终止本轮。/ 0 waits, 1 connects, -1 terminates this round.
+/*
+ * 0 等待、1 连接、-1 放弃本轮。/ 0 waits, 1 connects, -1 gives up this round.
+ *
+ * 放弃不是终态：窗口内试满 10 次就按 30s/60s/120s/300s 退避，到期自动重开一轮。
+ * 以前这里把 failed 置成永久终态，路由抖一下设备就一直离线，直到用户进设置页手动重开 Wi-Fi。
+ * Giving up is not terminal: after ten tries inside the window the next round waits
+ * 30/60/120/300 s and then restarts on its own. This used to latch `failed` forever, so a single
+ * router hiccup left the device offline until the user reopened Wi-Fi settings by hand.
+ *
+ * 次数从 5 提到 10 是实机逼出来的：AP 换信道后第一次关联常回 reason=201（NO_AP_FOUND），
+ * 连试五次都在十几秒内打完，然后退避 30 秒才重来——读者要等四十多秒才看到"已连接"。
+ * 让它在同一个 30 秒窗口里一直试，通常第二次或第三次就上去了。
+ * Ten instead of five came from a real session: after the AP changed channel the first
+ * association returned reason=201 (NO_AP_FOUND), five tries burned out in fourteen seconds, and
+ * the 30 s backoff meant forty-odd seconds before the reader saw a link. Trying for the whole
+ * window normally lands on the second or third attempt.
+ */
 static int connection_poll(transfer_connection_t *c, int64_t now) {
-    if (c->online || c->failed) return 0;
-    if (now >= c->deadline_ms || (c->pending && c->attempts >= 5)) {
-        c->failed = true; c->pending = false; return -1;
+    if (c->online) return 0;
+    if (c->failed) {
+        if (now < c->retry_ms) return 0;
+        c->failed = false; c->pending = true; c->attempts = 0;
+        c->deadline_ms = now + 30000; c->next_ms = now;
+    }
+    if (now >= c->deadline_ms || (c->pending && c->attempts >= 10)) {
+        static const int64_t steps[] = {30000, 60000, 120000, 300000};
+        c->failed = true; c->pending = false;
+        c->retry_ms = now + steps[c->rounds < 4 ? c->rounds : 3];
+        if (c->rounds < 8) ++c->rounds;
+        return -1;
     }
     if (!c->pending || now < c->next_ms) return 0;
     c->pending = false; ++c->attempts; return 1;

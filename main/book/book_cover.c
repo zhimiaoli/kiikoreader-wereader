@@ -992,6 +992,22 @@ static void cover_cache_write(const char *path, const cover_cache_header_t *head
     remove(temp);
 }
 
+// 逐章缓存的微读书在磁盘上只是标记文件，内嵌封面无从解析；封面按"书旁的灰阶快照"提供。
+// A chapter-cached WeRead book is a marker file with no embedded artwork, so its cover comes
+// from a grayscale snapshot beside the book.
+static bool cover_sidecar_read(const char *path, uint8_t out[BOOK_COVER_W * BOOK_COVER_H]) {
+    if (!path || !*path) return false;
+    char side[300];
+    if (snprintf(side, sizeof(side), "%s.gray", path) >= (int)sizeof(side)) return false;
+    struct stat st;
+    if (stat(side, &st) || st.st_size != (off_t)(BOOK_COVER_W * BOOK_COVER_H)) return false;
+    FILE *file = fopen(side, "rb");
+    if (!file) return false;
+    bool ok = fread(out, 1, BOOK_COVER_W * BOOK_COVER_H, file) == BOOK_COVER_W * BOOK_COVER_H;
+    fclose(file);
+    return ok;
+}
+
 static bool book_cover_load_gray_impl(const char *path, const char *title, const char *author,
                           uint8_t out[BOOK_COVER_W * BOOK_COVER_H],
                           bool allow_decode, bool *pending, bool allow_auto, bool *auto_cache) {
@@ -1014,6 +1030,10 @@ static bool book_cover_load_gray_impl(const char *path, const char *title, const
 #else
     if (cover_cache_read(cache_path, &key, out)) return true;
 #endif
+    if (cover_sidecar_read(path, out)) {
+        cover_cache_write(cache_path, &key, out);
+        return true;
+    }
     if (!allow_decode) { if (pending) *pending = true; return false; }
 
     bool good = false;
@@ -1108,6 +1128,9 @@ static bool book_cover_load_list_gray_sized_impl(const char *path, const char *t
 #else
 #endif
     if(!list_cache_path(cache_path,sizeof(cache_path),limit_w,limit_h))return false;
+    // 全尺寸列表封面同样可以是旁挂快照；缩略尺寸仍需解码缩放，走原路径。
+    // Full-size list covers accept the sidecar too; compact sizes still need scaling.
+    if(!compact && cover_sidecar_read(path, out)) return true;
     FILE *file = fopen(cache_path, "rb");
     if (!file) {
         // 旧目录回退：升级后仍能读上次生成的列表封面。
@@ -1581,6 +1604,10 @@ bool book_image_file_grayscale(const char *path, bool png, unsigned width, unsig
     }
     fclose(file);
     return ok;
+}
+
+bool book_cover_sidecar_gray(const char *path, uint8_t out[BOOK_COVER_W * BOOK_COVER_H]) {
+    return cover_sidecar_read(path, out);
 }
 
 bool book_cover_load_gray(const char *p,const char *t,const char *a,uint8_t out[BOOK_COVER_W * BOOK_COVER_H],bool decode,bool *pending) {

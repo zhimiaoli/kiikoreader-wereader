@@ -131,6 +131,3 @@ Desktop.ini
 # 两板内建扩展字库。/ Expanded embedded assets for both boards.
 !boards/metalio47/src/main/assets/builtin.ttf
 !boards/metalio47/src/main/assets/ui-hanzi.bin
-
-# 本地固件产物：16 MiB 全闪存包体积大，不进版本库
-/releases/

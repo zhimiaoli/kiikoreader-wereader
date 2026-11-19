@@ -1735,28 +1735,10 @@ void app_loop_run(const app_loop_config_t* config) {
 #else
         if (s_quick.open && quick_status() != s_quick_status) quick_buttons_present(&ctx,current);
 #endif
-        /* on_tick 是唯一能自己发起重绘的通道：下面这道门任意一项为真，后台任务跑完也不会
-         * 自己更新界面，屏幕就停在上一个画面，直到用户点一下才恢复（缓存收尾那次实测卡了
-         * 125 秒）。用一条限频告警把到底卡在哪一项暴露出来，别让它再无声地挂住。
-         * on_tick is the only self-initiated redraw path. If any gate below stays set the UI
-         * never repaints after a background job finishes and stays on the old frame until a tap.
-         * Log which gate is holding, rate-limited, instead of failing silently. */
-        const bool tick_gated = power_dialog_open || s_quick.open || quick_input_owned ||
-            ui_click_feedback_active() || menu_open ||
-            ctx.request_app != NULL || ctx.request_menu || ctx.request_return;
-        if (!tick_gated && current->on_tick != NULL) {
+        if (!power_dialog_open && !s_quick.open && !quick_input_owned && !ui_click_feedback_active() && !menu_open && !ctx.request_app && !ctx.request_menu && !ctx.request_return && current->on_tick != NULL) {
             app_redraw_t redraw = current->on_tick(&ctx);
             if (redraw == APP_REDRAW_PAGE || redraw == APP_REDRAW_FULL) held_key = -1;
             present_page(&ctx, current, &gesture, redraw);
-        } else if (tick_gated && current->on_tick != NULL) {
-            static int64_t gated_logged_ms;
-            if (ctx.now_ms - gated_logged_ms >= 5000) {
-                gated_logged_ms = ctx.now_ms;
-                ESP_LOGW("APP", "on_tick gated power=%d quick=%d quick_owned=%d feedback=%d menu=%d req_app=%d req_menu=%d req_ret=%d",
-                         (int)power_dialog_open, (int)s_quick.open, (int)quick_input_owned,
-                         (int)ui_click_feedback_active(), (int)menu_open,
-                         (int)(ctx.request_app != NULL), (int)ctx.request_menu, (int)ctx.request_return);
-            }
         }
         if (ctx.user_activity) { last_input_ms = ctx.now_ms; ctx.user_activity = false; }
         // 充电插拔不属于用户输入，不打断锁屏/触摸或覆盖层，只更新已显示的状态栏。

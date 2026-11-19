@@ -12,6 +12,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "book_chapter_cache.h"
 #include "book_source.h"
 #include "ui_kit.h"
 #include "ui_nav.h"
@@ -146,6 +147,55 @@ static void toc_title(uint8_t *fb, EpdRect box, int preferred_px, const char *te
                                 EPD_DRAW_ALIGN_LEFT, background);
 }
 
+/*
+ * 目录里的章节标题必须同字号，和本地书架的目录一致。
+ * ui_text_title_fit 会按"这一条标题"的缺字情况挑字号：标题里混进一个用户字体没有的字，
+ * 整行就会掉到点阵字号，同一页因此出现两种大小。这里先用固定样本把字号定死，
+ * 行内只用截断控制宽度，字号不再随标题内容变化。
+ * Chapter titles must share one size, matching the local shelf's TOC. ui_text_title_fit
+ * chooses the size from each title's own missing glyphs, so one character absent from the
+ * user font drops that whole row to the bitmap size and a single page ends up with two
+ * sizes. Fix the size once from a constant sample and let truncation alone handle width.
+ */
+static int toc_uniform_px(int preferred_px) {
+    static const char sample[] = "目录第一章标题";
+    int px = ui_text_effective_px(preferred_px);
+    int fitted = ui_text_title_fit(NULL, px, 0, sample);
+    return fitted > 0 ? fitted : px;
+}
+
+static void toc_title_sized(uint8_t *fb, EpdRect box, int px, const char *text, uint8_t background) {
+    char sample[160], shown[160];
+    one_line(sample, sizeof(sample), text);
+    memcpy(shown, sample, strlen(sample) + 1);
+    if (px > box.height - 2) px = box.height - 2;
+    bool cut = false;
+    while (shown[0] && ui_text_title_width_px(px, shown, sample) > box.width) {
+        size_t n = strlen(shown);
+        if (!n) break;
+        size_t at = n - 1;
+        while (at && ((unsigned char)shown[at] & 0xc0) == 0x80) --at;
+        shown[at] = 0;
+        cut = true;
+    }
+    if (cut && shown[0]) {
+        // 省略号自己也要占宽度，先让出它的宽度再补，避免标题压到右侧状态标签。
+        // The ellipsis occupies width too, so reserve it before appending; otherwise the title
+        // would push into the cache label on the right.
+        const int dots = ui_text_title_width_px(px, "…", sample);
+        while (shown[0] && ui_text_title_width_px(px, shown, sample) + dots > box.width) {
+            size_t n = strlen(shown);
+            if (!n) break;
+            size_t at = n - 1;
+            while (at && ((unsigned char)shown[at] & 0xc0) == 0x80) --at;
+            shown[at] = 0;
+        }
+        if (strlen(shown) + sizeof("…") <= sizeof(shown)) strcat(shown, "…");
+    }
+    ui_text_title_background_vc(fb, box.x, box.y + box.height / 2, px, shown, sample,
+                                EPD_DRAW_ALIGN_LEFT, background);
+}
+
 int book_toc_hit(uint16_t x, uint16_t y, int page, size_t chapters) {
     if (x < 100 && y >= 76 && y < 151) return BOOK_TOC_BACK;
     if (y >= 1018 && y < 1086) {
@@ -216,6 +266,23 @@ static void volume_chevron(uint8_t *fb,EpdRect r,bool open) {
     }
 }
 
+/*
+ * 章节右侧的缓存状态。只对逐章缓存书源显示：普通 EPUB 全本在本地，"未缓存"没有意义。
+ * 文字只用灰阶，不加边框——目录行本身已有卡片轮廓，再加一层会显得拥挤。
+ * Per-chapter cache state on the right. Only chapter-cached sources show it: a plain EPUB is
+ * wholly local, where "not cached" would be meaningless. Grayscale text without a pill keeps
+ * the row readable, since the row already carries a card outline.
+ */
+static bool toc_cache_label(size_t spine, char *label, size_t cap) {
+    switch (book_chapter_cache_state(spine)) {
+    case BOOK_CH_CACHE_READY: snprintf(label, cap, "已缓存"); return true;
+    case BOOK_CH_CACHE_PENDING: snprintf(label, cap, "下载中"); return true;
+    case BOOK_CH_CACHE_FAILED: snprintf(label, cap, "需重试"); return true;
+    case BOOK_CH_CACHE_MISSING: snprintf(label, cap, "未缓存"); return true;
+    default: return false;
+    }
+}
+
 void book_toc_render(uint8_t *fb, const char *book_title, size_t chapters,
                      size_t current, int page, const char *message) {
     ui_clear_page(fb);
@@ -251,6 +318,10 @@ void book_toc_render(uint8_t *fb, const char *book_title, size_t chapters,
     } else if (!chapters) {
         ui_text_box(fb,(EpdRect){72,408,540,72},25,"这本书没有可用目录",EPD_DRAW_ALIGN_CENTER,false);
     } else {
+        // 整个目录共用一个字号：章节正文行、卷标题行都取同一个值，翻页也不会变形。
+        // One size for the whole TOC: chapter rows and volume rows share it, so paging never
+        // changes the type size.
+        const int row_px = toc_uniform_px(30);
         for (int row = 0; row < BOOK_TOC_ROWS; ++row) {
             int target=visible_target((size_t)page*BOOK_TOC_ROWS+row,chapters);
             if(target==-1)break;
@@ -263,9 +334,9 @@ void book_toc_render(uint8_t *fb, const char *book_title, size_t chapters,
                 char title[160],count[32];
                 if(book_navigation_volume_title(group,title,sizeof(title))!=ESP_OK)
                     snprintf(title,sizeof(title),"第 %u 卷",(unsigned)group+1);
-                toc_title(fb,(EpdRect){r.x+54,r.y+9,416,76},29,title,background);
+                toc_title_sized(fb,(EpdRect){r.x+54,r.y+9,416,76},row_px,title,background);
                 snprintf(count,sizeof(count),"%u 节",(unsigned)volume_body_count(group));
-                toc_title(fb,(EpdRect){r.x+478,r.y+9,112,76},21,count,background);
+                toc_title_sized(fb,(EpdRect){r.x+478,r.y+9,112,76},21,count,background);
                 continue;
             }
             size_t index=(size_t)target;
@@ -278,6 +349,8 @@ void book_toc_render(uint8_t *fb, const char *book_title, size_t chapters,
             if(volumes)snprintf(number,sizeof(number),"·");
             else snprintf(number, sizeof(number), "%02u", (unsigned)index + 1);
             ui_text_box(fb,(EpdRect){r.x+14,r.y+11,58,72},21,number,EPD_DRAW_ALIGN_LEFT,false);
+            char cache_label[16] = "";
+            bool has_cache = toc_cache_label(source_index, cache_label, sizeof(cache_label));
             char raw[160] = "", label[160];
             if (book_navigation_title(index, raw, sizeof(raw)) != ESP_OK || !raw[0])
                 snprintf(raw, sizeof(raw), "第 %u 节", (unsigned)index + 1);
@@ -287,10 +360,18 @@ void book_toc_render(uint8_t *fb, const char *book_title, size_t chapters,
                 snprintf(raw, sizeof(raw), "第 %u 节", (unsigned)index + 1);
             one_line(label, sizeof(label), raw);
             if (!label[0]) snprintf(label, sizeof(label), "第 %u 节", (unsigned)index + 1);
-            toc_title(fb, (EpdRect){r.x+79,r.y+9,selected?420:495,76}, 30, label,
-                       selected ? 0xc0 : UI_GRAY_WHITE);
-            if (selected)
-                ui_text_box(fb,(EpdRect){r.x+r.width-93,r.y+11,71,72},24,"当前",EPD_DRAW_ALIGN_RIGHT,false);
+            // 状态标签占右侧固定宽度，标题要给它让位，否则会互相压字。
+            // 当前章节靠整行底色区分，不再重复写"当前"。
+            // The state label owns a fixed strip on the right, so the title steps aside. The
+            // current chapter is already marked by the row background, so it needs no label.
+            const int reserve = has_cache ? 92 : 0;
+            int title_width = r.width - 79 - 16 - reserve;
+            toc_title_sized(fb, (EpdRect){r.x+79,r.y+9,title_width,76}, row_px, label,
+                            selected ? 0xc0 : UI_GRAY_WHITE);
+            if (has_cache)
+                ui_text_title_background_vc(fb, r.x + r.width - 16, r.y + r.height / 2, 20,
+                                            cache_label, cache_label, EPD_DRAW_ALIGN_RIGHT,
+                                            selected ? 0xc0 : UI_GRAY_WHITE);
         }
     }
     const int pages = book_toc_pages(chapters);

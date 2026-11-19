@@ -31,8 +31,16 @@ function(kiiko_board_sources output component_dir)
         set(selected "${KIIKO_BOARD_ROOT}/src/${relative}")
         if(EXISTS "${selected}")
             get_filename_component(original_dir "${original}" DIRECTORY)
+            # 中文：Windows 上 ABSOLUTE 返回反斜杠路径。源文件级 INCLUDE_DIRECTORIES 会被 CMake
+            # 在生成 ninja 时再转回原生反斜杠，写进响应文件后被 gcc 的 @rsp 解析把 \U \b \s 当转义符
+            # 吃掉，-I 指向不存在的目录。COMPILE_OPTIONS 是原样透传的，用正斜杠 -I 最稳。
+            # English: ABSOLUTE yields native backslashes on Windows, and CMake re-emits source-level
+            # INCLUDE_DIRECTORIES with native separators; inside the ninja response file gcc's @rsp
+            # parser eats \U \b \s as escapes. COMPILE_OPTIONS is passed through verbatim, so emit an
+            # explicit forward-slash -I instead.
+            file(TO_CMAKE_PATH "${original_dir}" original_dir_cmake)
             if(NOT CMAKE_SCRIPT_MODE_FILE)
-                set_source_files_properties("${selected}" PROPERTIES INCLUDE_DIRECTORIES "${original_dir}")
+                set_property(SOURCE "${selected}" APPEND PROPERTY COMPILE_OPTIONS "-I${original_dir_cmake}")
             endif()
             list(APPEND selected_sources "${selected}")
         else()

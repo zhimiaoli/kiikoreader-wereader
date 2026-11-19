@@ -36,6 +36,7 @@
 #include "book_store.h"
 #include "book_progress.h"
 #include "book_title.h"
+#include "weread.h"
 #include "book_added.h"
 #include "display.h"
 #include "file_tree.h"
@@ -398,7 +399,7 @@ static void notify_moved_tree(const char *old_path, const char *new_path, unsign
 static void file_deleted(const char *path, bool directory, void *ctx) {
     (void)ctx;
     if (directory) return;
-    if (is_book_path(path)) { (void)book_progress_forget(path); book_added_forget(path); }
+    if (is_book_path(path)) { (void)book_progress_forget(path); book_added_forget(path); (void)wr_forget_book(path); }
     (void)book_title_clear(path);
     if (!strcmp(app_settings_system_font_path(), path)) {
         app_settings_set_system_font_path("");

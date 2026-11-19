@@ -12,10 +12,21 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "html_text.h"
+#include "book_epub.h"
 typedef enum {
     BOOK_KIND_TXT, ///< 文本 / Plain text
     BOOK_KIND_EPUB, ///< EPUB 容器 / EPUB container
 } book_kind_t;
+/*
+ * 虚拟书源解析器：路径正常但内容不是完整 EPUB 时（例如微信读书的逐章缓存书），
+ * 由注册方判断并交出虚拟书源。返回 true 表示已接管，*src 有效。
+ * Virtual source resolver: for a path whose content is not a complete EPUB (for example a
+ * WeRead book cached chapter by chapter), the registrant decides and hands over a virtual
+ * source. Returning true takes ownership; *src is then valid.
+ */
+typedef bool (*book_virtual_resolver_t)(const char *path, book_epub_virtual_t *src);
+/// 注册虚拟书源解析器；传 NULL 注销。开书时优先询问它。/ Register a resolver; NULL unregisters.
+void book_set_virtual_resolver(book_virtual_resolver_t resolver);
 /// 打开并替换当前书源。/ Open and replace the current source.
 esp_err_t book_open(const char *path);
 /// 关闭书源并释放目录。/ Close the source and free its index.

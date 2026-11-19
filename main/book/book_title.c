@@ -199,6 +199,14 @@ bool book_name_from_path(const char *path,char *title,size_t title_cap,char *aut
     if(title&&title_cap)title[0]=0;
     if(author&&author_cap)author[0]=0;
     if(!path||!title||!title_cap||strnlen(path,4096)>=4096)return false;
+    /* 显式记录过书名的书（微信读书分章缓存书没有 OPF 元数据）优先用它：
+     * 否则书库只能按文件名显示成 wr-<owner>+<bookid>。这里是所有列表取名的公共入口，
+     * 放在此处能让书库、最近阅读、传书页保持一致。
+     * Books with a stored title win here: a chapter-cached WeRead book has no OPF metadata,
+     * so the list would otherwise show its on-disk name. This is the shared entry point for
+     * every list, so the override applies to the library, recents and transfer pages alike. */
+    if (book_title_get(path, title, title_cap)) return true;
+    title[0]=0;
     const char *base=strrchr(path,'/');base=base?base+1:path;
     name_span_t s={base,strlen(base)},auth={0};
     const char *dot=strrchr(base,'.');

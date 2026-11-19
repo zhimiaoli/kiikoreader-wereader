@@ -203,6 +203,16 @@ int main(void) {
     assert(connection_poll(&net, 29999) == 0);
     assert(connection_poll(&net, 30100) == -1 && net.failed);
     assert(connection_poll(&net, 40000) == 0);
+    // 放弃不是终态：30 秒退避到期后自己重开一轮，不需要用户去动 Wi-Fi 设置。
+    // Giving up is not terminal: the round restarts once the 30 s backoff expires.
+    {
+        transfer_connection_t back; memset(&back, 0, sizeof(back));
+        connection_begin(&back, 0);
+        assert(connection_poll(&back, 0) == 1);
+        assert(connection_poll(&back, 30001) == -1 && back.failed);
+        assert(connection_poll(&back, 59999) == 0);
+        assert(connection_poll(&back, 60001) == 1 && back.attempts == 1 && !back.failed);
+    }
     connection_begin(&net, 0);
     for (int i = 0; i < 5; ++i) {
         assert(connection_poll(&net, i * 1000) == 1);

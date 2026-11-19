@@ -187,6 +187,7 @@ extern const app_desc_t app_device_settings;
 #include "esp_rom_crc.h"
 #else
 #endif
+#include "book_chapter_cache.h"
 #include "book_cover_jobs.h"
 #include "book_shelf_page_cache.h"
 #include "book_lock_collage.h"
@@ -221,6 +222,7 @@ extern const app_desc_t app_device_settings;
 #if KIIKO_BOARD_METALIO47
 #include "app_weread.h"
 #include "weread.h"
+#include "weread_cache.h"
 #endif
 #include "read_pico_transfer.h"
 #include "read_pico_search.h"
@@ -330,6 +332,12 @@ typedef struct {
 static const char* TAG = "book";
 static book_view_t s_view;
 static int s_presented_view = -1;
+/* 上一帧推的是逐章缓存的等待卡片：它整屏填充，换成正文时必须做一次完整清白，
+ * 否则卡片的灰底与边框会以鬼影的形式留在页脚/工具栏一带。
+ * The last presented frame was the chapter-cache waiting card: it covers the whole panel, so
+ * swapping in the body needs one full clean, or the card's gray ground and frame linger as ghost
+ * lines around the footer and tool rail. */
+static bool s_presented_cache_card;
 static bool s_reader_image_refresh_pending;
 static bool s_reader_turn_pending;
 // 只记录成功推屏的纯正文基准，避免跨章或退出插图时误用文字波形。
@@ -581,6 +589,9 @@ static reader_image_t *s_page_images;
 static int s_page_image_count;
 static size_t s_page_images_for = SIZE_MAX;
 static uint32_t s_page_images_generation;
+/// 一页插图解码：按槽位顺序解成灰阶位图，解不出来的槽位留空。
+/// Decode one page's illustrations into grayscale bitmaps in slot order; failed slots stay empty.
+static int decode_page_images(size_t page, reader_image_t **out);
 static size_t s_block_count;
 static size_t s_text_len, s_chapter, s_page;
 // 整页插图的双指缩放：1000 为原始大小；缩放与位置只属于当时那一页，换页自动还原。
@@ -658,6 +669,23 @@ static EpdRect s_du_area;
 static SemaphoreHandle_t s_draw_lock, s_prep_done;
 static TaskHandle_t s_prep_task;
 static atomic_bool s_prep_stop;
+/*
+ * 4 KB 的表放 PSRAM，不放内部 RAM：这块板的内部余量常态只有 25–38 KB，一个静态 4 KB 数组
+ * 就拿走六分之一，而它只服务于插图合成。
+ * The 4 KB table lives in PSRAM, not internal RAM: this board normally has 25–38 KB free, and a
+ * static 4 KB array would take a sixth of it for something only illustration compositing uses.
+ */
+static uint8_t *s_dither_lut;
+static void dither_lut_build(void) {
+    if (s_dither_lut) return;
+    uint8_t *table = heap_caps_malloc(16u * 256u, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!table) return;
+    for (unsigned phase = 0; phase < 16; ++phase)
+        for (unsigned gray = 0; gray < 256; ++gray)
+            table[phase * 256u + gray] = ui_image_dither_gray((uint8_t)gray,
+                                                              (int)(phase & 3u), (int)(phase >> 2));
+    s_dither_lut = table;
+}
 static book_layout_draw_cursor_t s_prep_cursor;
 static uint32_t s_next_generation;
 static uint8_t* s_next_fb;
@@ -4390,6 +4418,49 @@ static void draw_reader_footnote_card(uint8_t *fb, size_t page, EpdRect body) {
         y += line_h;
     }
 }
+/*
+ * 把一页的插图位图画进光栅。位图由调用方给：当前页给 s_page_images，预排给页图缓存里的那一组。
+ * Paint one page's illustrations into a raster. The caller supplies the bitmaps: the current
+ * page's set, or the cached set when prefetching another page.
+ */
+static void draw_images_set(uint8_t *fb, size_t page, const reader_image_t *images, int count,
+                            EpdRect body) {
+    EpdRect band = book_layout_image_rect();
+    for (int i = 0; i < reader_image_slots(page); ++i) {
+        int index = -1, raw_x = -1, y, width, height;
+        if (!book_layout_page_image_rect(page, i, &index, &raw_x, &y, &width, &height) &&
+            !reader_image_slot(page, i, &index, &y, &width, &height)) continue;
+        const reader_image_t *image = images && i < count ? &images[i] : NULL;
+        if (image && image->gray) {
+            int left = raw_x >= 0 ? raw_x : band.x + (band.width - image->width) / 2;
+            int top = band.y + y + (height - image->height) / 2;
+            if (raw_x >= 0) top = band.y + y;
+            // 页首插图贴到阅读区顶端：正文上方那点呼吸空间只属于正文，不该把插图压下来。
+            // A page-start illustration sits at the top of the reading area: the inset above
+            // body text belongs to text and must not push the illustration down.
+            if (y == 0) top = reader_image_top();
+            for (int iy = 0; iy < image->height; ++iy) {
+                const uint8_t *src = image->gray + (size_t)iy * image->width;
+                // 抖动只依赖（灰度, x&3, y&3）：查表代替每像素的除法与比较。
+                // Dithering depends only on (gray, x&3, y&3): a table replaces the per-pixel
+                // division and comparison.
+                const unsigned row_phase = ((unsigned)(top + iy) & 3u) * 4u;
+                for (int ix = 0; ix < image->width; ++ix) {
+                    const unsigned phase = row_phase | ((unsigned)(left + ix) & 3u);
+                    const uint8_t gray = inline_ink_gray(src[ix]);
+                    const uint8_t value = s_dither_lut ? s_dither_lut[phase * 256u + gray]
+                                                       : ui_image_dither_gray(gray, left + ix, top + iy);
+                    epd_draw_pixel(left + ix, top + iy, value, fb);
+                }
+            }
+        } else if (height >= UI_PX_CAPTION + 4 && width >= 70) {
+            char notice[64]; copy_text(notice, sizeof(notice), "此插图暂无法显示");
+            fit_text(notice, UI_PX_CAPTION, width - 8);
+            ui_text_vc(fb, body.x + body.width / 2, body.y + y + height / 2,
+                       UI_PX_CAPTION, notice, EPD_DRAW_ALIGN_CENTER, false);
+        }
+    }
+}
 static void draw_reader_images(uint8_t *fb, size_t page, EpdRect body) {
     // 位图和布局代次必须匹配；预渲染另一页不能复用当前页插图。
     // Match page and layout generation; a prefetched page must never borrow current-page bitmaps.
@@ -4424,33 +4495,7 @@ static void draw_reader_images(uint8_t *fb, size_t page, EpdRect body) {
         // 横向按插图区域居中：通栏时图片铺满整屏，不再留正文边距。
         // Center horizontally in the illustration region: with full bleed the image spans the
         // panel and no longer carries the body margins.
-        EpdRect band = book_layout_image_rect();
-        for (int i = 0; i < reader_image_slots(page); ++i) {
-            int index = -1, raw_x = -1, y, width, height;
-            if (!book_layout_page_image_rect(page, i, &index, &raw_x, &y, &width, &height) &&
-                !reader_image_slot(page, i, &index, &y, &width, &height)) continue;
-            const reader_image_t *image = s_page_images && i < s_page_image_count ? &s_page_images[i] : NULL;
-            if (image && image->gray) {
-                int left = raw_x >= 0 ? raw_x : band.x + (band.width - image->width) / 2;
-                int top = band.y + y + (height - image->height) / 2;
-                if (raw_x >= 0) top = band.y + y;
-                // 页首插图贴到阅读区顶端：正文上方那点呼吸空间只属于正文，不该把插图压下来。
-                // A page-start illustration sits at the top of the reading area: the inset above
-                // body text belongs to text and must not push the illustration down.
-                if (y == 0) top = reader_image_top();
-
-                for (int iy = 0; iy < image->height; ++iy)
-                    for (int ix = 0; ix < image->width; ++ix)
-                        epd_draw_pixel(left + ix, top + iy,
-                            ui_image_dither_gray(inline_ink_gray(image->gray[(size_t)iy * image->width + ix]),
-                                                 left + ix, top + iy), fb);
-            } else if (height >= UI_PX_CAPTION + 4 && width >= 70) {
-                char notice[64]; copy_text(notice, sizeof(notice), "此插图暂无法显示");
-                fit_text(notice, UI_PX_CAPTION, width - 8);
-                ui_text_vc(fb, body.x + body.width / 2, body.y + y + height / 2,
-                           UI_PX_CAPTION, notice, EPD_DRAW_ALIGN_CENTER, false);
-            }
-        }
+        draw_images_set(fb, page, s_page_images, s_page_image_count, body);
     }
 }
 static void reader_footer_progress(char *text,size_t cap,size_t page) {
@@ -4545,11 +4590,15 @@ static void draw_reader(uint8_t *fb,size_t page) {
 }
 #if KIIKO_BOARD_METALIO47
 // 复用现有四槽正文，无新整帧缓存；覆盖层不存进正文槽，正文/字体变化沿原代次和失效规则。
-// Reuse the existing four body slots without another frame; never cache overlays, and retain body/font invalidation.
+// 带图页也能走缓存：预排已把插图位图合成进那一帧，只有缩放/平移期间必须现场重画。
+// Reuse the existing four body slots without another frame; never cache overlays, and retain
+// body/font invalidation. Illustrated pages may come from the cache too: prefetch composites
+// their bitmaps into the frame, and only an active zoom or pan needs a live redraw.
 static void draw_reader_cached(uint8_t *fb,size_t page) {
-    const bool eligible=!s_clear_confirm&&!s_reader_notice[0]&&
+    const bool live_zoom = s_zoom_active||s_image_pan_active||s_image_zoom>READER_IMAGE_ZOOM_MIN;
+    const bool eligible=!live_zoom&&!s_clear_confirm&&!s_reader_notice[0]&&
         s_reader_panel!=READER_PANEL_BACKGROUND&&s_reader_panel!=READER_PANEL_BACKGROUND_PREVIEW&&
-        !book_layout_page_image_count(page)&&!app_settings_book_background_path()[0];
+        !app_settings_book_background_path()[0];
     const uint8_t *cached=eligible?reader_page_cache_find(page,book_layout_generation(),fb_bytes()):NULL;
     if(cached){
         memcpy(fb,cached,fb_bytes());
@@ -4573,9 +4622,16 @@ static void draw_reader_cached(uint8_t *fb,size_t page) {
 #define BOOK_PREP_RESERVE (1024u * 1024u)
 #endif
 #define BOOK_PREP_IDLE_US 4000
+/*
+ * allow_decode：只有后台预绘任务可以在这里解码（一张整页图要几百毫秒），UI 的空闲预绘路径
+ * 传 false —— 它拿锁的时间上限是 4 ms，不能拿来做解码。
+ * allow_decode: only the background prep task may decode here (a full-page bitmap takes a few
+ * hundred ms); the UI idle path passes false, because its lock budget is four milliseconds.
+ */
 static int reader_prefetch_step(void) {
     if(!s_next_fb||s_prep_page<0)return -1;
     if(!s_prep_cursor.generation)memset(s_next_fb,0xff,fb_bytes());
+    dither_lut_build();
     int result=book_layout_draw_slice(s_next_fb,(size_t)s_prep_page,body_rect(),s_px,&s_prep_cursor);
     if(result<0)invalidate_prep();
 #if KIIKO_BOARD_METALIO47
@@ -4591,7 +4647,7 @@ static int reader_prefetch_step(void) {
 // Cache current/previous/two future pages; borrow faces only under the existing draw lock.
 static bool reader_prefetch_target(void) {
     if(s_view!=READING||!s_text||s_toolbar||s_clear_confirm||s_reader_panel!=READER_PANEL_NONE||
-       app_settings_book_background_path()[0]||book_layout_page_image_count(s_page))return false;
+       app_settings_book_background_path()[0])return false;
     size_t total=book_layout_page_count();uint32_t generation=book_layout_generation();
     size_t targets[3]={s_page+1,s_page+2,s_page?s_page-1:SIZE_MAX};
     int target=-1;
@@ -4599,8 +4655,11 @@ static bool reader_prefetch_target(void) {
         for(unsigned i=0;i<3;++i)if(targets[i]<total&&targets[i]==(size_t)s_prep_page)target=s_prep_page;
     for(unsigned i=0;target<0&&i<3;++i) {
         size_t page=targets[i];
-        if(page<total&&!book_layout_page_image_count(page)&&
-           !reader_page_cache_find(page,generation,fb_bytes()))target=(int)page;
+        // 带图页不预排：解一页要 3–7 秒，预排它只会把翻页拖长；文字页没有这个代价。
+        // Illustrated pages are not prefetched: decoding one takes 3–7 s and only stretches the
+        // turn; text pages carry no such cost.
+        if(page>=total||book_layout_page_image_count(page))continue;
+        if(!reader_page_cache_find(page,generation,fb_bytes()))target=(int)page;
     }
     if(target<0)return false;
     if(s_prep_page!=target||s_prep_cursor.generation!=generation) {
@@ -4694,8 +4753,197 @@ static void reader_prefetch_idle(app_ctx_t *ctx) {
 #else
 #endif
 }
-static size_t current_toc_position(void) {
-    if(book_kind()==BOOK_KIND_TXT){size_t current=book_navigation_position(s_chapter,reader_page_offset(s_page));if(current!=SIZE_MAX)return current;}
+/* ------------------------------------------------------------------ */
+/* 逐章缓存：首开等待页与目录按需下载                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * s_warm_chapter >= 0 表示"这一章还没落地，先别显示占位正文"：阅读页画一张缓存进度卡片，
+ * 章节落盘后自动换成正文。s_toc_download >= 0 表示"目录里点了未缓存的章"，下载完成后
+ * 自动跳过去。两者都只轮询本地状态，不发起请求，也不会和后台下载任务抢资源。
+ * s_warm_chapter >= 0 means "this chapter is not local yet, so do not show the placeholder":
+ * the reader paints a cache-progress card and swaps in the text once it lands. s_toc_download
+ * >= 0 means an uncached chapter was tapped in the TOC and should open when it arrives.
+ * Both only poll local state; neither issues requests nor competes with the download task.
+ */
+static int s_warm_chapter = -1;
+/* 等待页要回到的章内字节偏移：云端进度可能落在一个还没缓存的章上，先记住偏移，
+ * 等章节落盘后再用它定位，读者才能停在手机上读到的那一句，而不是章首。
+ * Byte offset to resume at once the awaited chapter lands: a cloud position may point into a
+ * chapter that is not cached yet, so keep the offset and apply it after the chapter arrives —
+ * otherwise the reader lands at the chapter start instead of the sentence the phone stopped on. */
+static size_t s_warm_offset;
+static int s_toc_download = -1;
+static size_t s_toc_download_chapter = SIZE_MAX;
+/* 落盘后要不要直接进正文：进书、目录跳转、云端进度是"要"；翻页碰到未缓存的章是"不要"——
+ * 读者只是翻了一页，不该被下载完成后的自动跳转带走。
+ * Whether to enter the text once the chapter lands: opening, a TOC jump and a cloud position say
+ * yes; a page turn that ran into an uncached chapter says no — one flip should not end with the
+ * reader being teleported after the download finishes. */
+static bool s_warm_enter;
+/* 翻到未缓存章的方向：+1 是往后翻（落盘后进本章第一页），-1 是往回翻（进本章最后一页）。
+ * 读者从"上一页"进到未缓存的章，想看的是这一章的结尾，而不是它的开头。
+ * Direction of the turn into an uncached chapter: +1 forward (enter its first page), -1 backward
+ * (enter its last page). Coming back from the previous page, the reader wants the chapter's end,
+ * not its start. */
+static int s_warm_direction = 1;
+/* 目录徽标的新鲜度：章节落盘计数变了就重画，读者停在目录上也能看到"下载中"变成"已缓存"。 */
+/* TOC badge freshness: repaint when the landed-chapter counter moves, so a reader sitting on the
+ * TOC sees "下载中" turn into "已缓存". */
+static unsigned s_toc_cache_epoch;
+static bool s_toc_cache_seen;
+static int64_t s_cache_poll_ms;
+/* 阅读中补排下一章的节流时刻：每 5 秒最多提醒一次，靠缓存层自己去重。 */
+/* Throttle for re-queueing the next chapter while reading; the cache layer dedupes the rest. */
+static int64_t s_next_prefetch_ms;
+static int64_t s_toc_download_ms;
+static int64_t s_warm_start_ms;
+static bool s_warm_failed;
+/* 等待期的自动重排：任务停下却没落盘时不要只把卡片改成"未完成"就撒手，按 8 秒退避重排几次，
+ * 网络自己恢复时读者不用退出重进。次数用尽才提示可退出重试。
+ * Auto re-queue while waiting: when the job ends without landing, do not just relabel the card as
+ * unfinished — re-queue every 8 s a few times, so a link that comes back does not force the
+ * reader to leave and re-enter. Only after the budget is spent does it suggest leaving. */
+static int64_t s_warm_retry_ms;
+static unsigned s_warm_retries;
+static unsigned s_cache_shown_done, s_cache_shown_percent;
+
+static const char *cache_state_text(size_t chapter) {
+    switch (book_chapter_cache_state(chapter)) {
+    case BOOK_CH_CACHE_PENDING: return "正在缓存本章";
+    case BOOK_CH_CACHE_FAILED: return "本章缓存失败，可重试";
+    case BOOK_CH_CACHE_MISSING: return "本章尚未缓存";
+    default: return "";
+    }
+}
+
+// 等待页只读本地状态：章节数来自目录，百分比来自单章下载阶段。
+// The waiting page reads local state only: the total comes from the TOC, the percentage from
+// the in-chapter download stage.
+/*
+ * 正在等哪一章：首开/云端进度/翻页用 s_warm_chapter，目录跳转用 s_toc_download_chapter。
+ * 三者共用同一张卡片——同样是"这一章还在下载"，不该被画成三种样子。
+ * Which chapter is awaited: s_warm_chapter for first open, cloud position and page turns,
+ * s_toc_download_chapter for a TOC jump. All three share one card, so the same wait never
+ * looks like three different things.
+ */
+static size_t wait_chapter(void) {
+    if (s_warm_chapter >= 0) return (size_t)s_warm_chapter;
+    if (s_toc_download >= 0 && s_toc_download_chapter != SIZE_MAX) return s_toc_download_chapter;
+    return 0;
+}
+
+static void draw_cache_wait(uint8_t *fb) {
+    unsigned done = 0, total = 0, percent = 0;
+    (void)book_chapter_cache_progress(&done, &total, &percent);
+    const size_t chapter = wait_chapter();
+    if (percent == 0 && total > 1) percent = (unsigned)((uint64_t)done * 100 / total);
+    if (percent > 100) percent = 100;
+    /* 云端进度只属于"首开这本书"那条路；目录跳转时这张卡片不该说自己在定位进度。 */
+    /* The cloud seed belongs to the first-open path only; a TOC jump must not claim it. */
+    const wr_seed_t seed = s_warm_chapter >= 0 ? wr_cloud_seed_state(NULL, NULL) : WR_SEED_IDLE;
+
+    ui_clear_page(fb);
+    ui_nav_status(fb);
+    /*
+     * 版式沿用固件自己的弹窗（账户页、操作菜单）：568 宽、20 圆角、0x50 描边、系统字号。
+     * 这张卡片原先画在阅读页字号下（不放大），21/20 px 在墨水屏上只有脚注大小，读者要凑近看。
+     * The layout follows the firmware's own dialogs (account page, action menu): 568 wide,
+     * 20 radius, 0x50 frame, system type scale. The card used to be painted at reader scale,
+     * where 20–21 px reads like a footnote on an ink panel.
+     */
+    EpdRect card = {58, 320, 568, 440};
+    ui_fill_round_rect(fb, card, 20, UI_GRAY_WHITE);
+    ui_draw_control_frame(fb, card, 20, 0x50);
+    ui_text_set_system_scale(true);
+
+    char line[160];
+    const char *book = s_book_title[0] ? s_book_title : s_title;
+    if (!book || !book[0]) book = "正在打开";
+    snprintf(line, sizeof(line), "%s", book);
+    fit_text(line, 34, card.width - 88);
+    ui_text_box(fb, (EpdRect){card.x + 44, card.y + 40, card.width - 88, 60}, 34, line,
+                EPD_DRAW_ALIGN_CENTER, false);
+    ui_hairline(fb, card.y + 118, card.x + 44, card.width - 88, 0x68);
+
+    if (seed == WR_SEED_PENDING) snprintf(line, sizeof(line), "正在读取云端阅读进度");
+    /* 只报"当前这一章"：读者要知道的是还有哪一章没到，不是全书总共多少章；
+     * "第 7 / 40 章"在墨水屏上还会被误读成"正在缓存第 7 到 40 章"。
+     * Report only the chapter being fetched: what matters is which one is still missing, not the
+     * book's chapter total, and "7 / 40" on an ink panel even reads as "chapters 7 through 40". */
+    else snprintf(line, sizeof(line), "正在缓存第 %u 章", (unsigned)chapter + 1);
+    ui_text_box(fb, (EpdRect){card.x + 44, card.y + 142, card.width - 88, 48}, 28, line,
+                EPD_DRAW_ALIGN_CENTER, false);
+
+    EpdRect track = {card.x + 44, card.y + 206, card.width - 88, 22};
+    ui_fill_round_rect(fb, track, 11, 0xd8);
+    int filled = track.width * (int)percent / 100;
+    if (filled > 4) ui_fill_round_rect(fb, (EpdRect){track.x + 2, track.y + 2,
+                                     filled - 4, track.height - 4}, 9, 0x50);
+    snprintf(line, sizeof(line), "%u%%", percent);
+    ui_text_box(fb, (EpdRect){track.x, track.y + 32, track.width, 44}, 26, line,
+                EPD_DRAW_ALIGN_RIGHT, false);
+
+    char chapter_name[160];
+    chapter_name[0] = 0;
+    if (book_chapter_title(chapter, chapter_name, sizeof(chapter_name)) == ESP_OK && chapter_name[0]) {
+        fit_text(chapter_name, 22, card.width - 96);
+        ui_text_box(fb, (EpdRect){card.x + 48, card.y + 288, card.width - 96, 40}, 22, chapter_name,
+                    EPD_DRAW_ALIGN_CENTER, false);
+    }
+    /* 目录跳转与首开一样是"下完就进正文"，只有翻页碰到未缓存的章才停在本页。 */
+    /* A TOC jump enters the text once the chapter lands, just like first open; only a page
+     * turn into an uncached chapter stays put. */
+    /* 三种入口都会直接进正文，差别只在落点：往后翻进章首，往回翻进章末，云端进度进那一句。 */
+    /* All three entries land in the text; only the landing spot differs: forward goes to the
+     * chapter start, backward to its end, a cloud position to the exact sentence. */
+    const bool to_end = s_warm_chapter >= 0 && s_warm_direction < 0 && s_warm_offset == 0;
+    ui_text_box(fb, (EpdRect){card.x + 44, card.y + 356, card.width - 88, 44}, 22,
+                s_warm_failed ? (s_warm_retries < 4 ? "网络不稳定，正在重试缓存" :
+                                                     "缓存未完成，可按返回键退出后重试") :
+                seed == WR_SEED_PENDING ? "正在定位到手机上停下的那一章" :
+                to_end ? "缓存完成后进入本章最后一页" : "缓存完成后自动进入正文",
+                EPD_DRAW_ALIGN_CENTER, false);
+    /*
+     * 这里原来写着"按返回键可退出，本章下完后暂停缓存"。长按返回在固件里是"回主页"，不是
+     * 退出书籍，这句话既不准又多占一行；卡片上的进度与章名已经说明了正在做什么。
+     * This used to say "press back to leave; caching pauses after this chapter". A long press is
+     * bound to Home in this firmware, not to leaving the book, so the line was both wrong and an
+     * extra row; the progress and chapter name already say what is happening.
+     */
+    ui_text_set_system_scale(false);
+}
+
+/*
+ * 翻页碰到未缓存的章：停在原页、盖上等待卡片，并把这一章排进预取。
+ * 绝不把占位正文当正文显示，也不在下载完成后把读者自动带走——落盘后卡片消失，读者再翻
+ * 一次才进正文。目录跳转与首开走的是"落盘后直接进正文"的另一条路（s_warm_enter）。
+ * Flipping into an uncached chapter keeps the page where it is and puts up the waiting card,
+ * queueing that chapter. It never shows the placeholder as text and never moves the reader once
+ * the download finishes: the card drops and the next flip enters the text. TOC jumps and first
+ * open take the other path, where landing enters the chapter directly (s_warm_enter).
+ */
+static bool wait_for_chapter(app_ctx_t *ctx, size_t chapter, int direction) {
+    const book_ch_cache_t state = book_chapter_cache_state(chapter);
+    if (state == BOOK_CH_CACHE_READY || state == BOOK_CH_CACHE_UNKNOWN) return false;
+    s_warm_chapter = (int)chapter;
+    /* 落盘后一律进正文：翻页等来的章也进去，读者不必再翻一次。方向决定落在章首还是章末。
+     * Always enter the text once the chapter lands — including one awaited by a page turn, so the
+     * reader never has to flip again. The direction decides first page versus last page. */
+    s_warm_enter = true;
+    s_warm_direction = direction;
+    s_warm_offset = 0;
+    s_warm_failed = false;
+    s_warm_start_ms = ctx->now_ms;
+    s_warm_retry_ms = 0;
+    s_warm_retries = 0;
+    s_cache_poll_ms = 0;
+    s_cache_shown_done = s_cache_shown_percent = 0;
+    (void)book_chapter_cache_request(chapter);
+    return true;
+}
+
+static size_t current_toc_position(void) {    if(book_kind()==BOOK_KIND_TXT){size_t current=book_navigation_position(s_chapter,reader_page_offset(s_page));if(current!=SIZE_MAX)return current;}
     size_t count = book_navigation_count();
     if (s_selected_toc < count && book_navigation_chapter(s_selected_toc) == s_chapter)
         return s_selected_toc;
@@ -4729,6 +4977,10 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
         return;
     }
     if (s_view == TOC) {
+        /* 目录里点了未缓存的章：盖同一张等待卡片，与首开、云端进度看到的一模一样。
+         * A TOC tap on an uncached chapter puts up the same waiting card the first open and a
+         * cloud position use, instead of a one-line hint under the list. */
+        if (s_toc_download >= 0) { draw_cache_wait(fb); unlock_draw(); return; }
         book_toc_render(fb, s_book_title[0] ? s_book_title : s_title,
                         book_navigation_count(), current_toc_position(), ctx->leaf, s_message);
         if (s_toc_jump_open)
@@ -4737,6 +4989,7 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
         return;
     }
     if (s_view == READING && s_text) {
+        if (s_warm_chapter >= 0) { draw_cache_wait(fb); unlock_draw(); return; }
         if(s_reader_panel==READER_PANEL_TOUCH_SETTINGS||s_reader_panel==READER_PANEL_TOUCH_MORE){rc_draw_current(fb);unlock_draw();return;}
         if (s_reader_panel == READER_PANEL_FONT_RECOVERY) {
             ui_clear_page(fb);
@@ -5064,7 +5317,8 @@ static bool present_book_frame(app_ctx_t* ctx, app_redraw_t redraw) {
     enum EpdDrawError err;
     bool image_gray_refresh = s_reader_image_refresh_pending && s_view == READING &&
         s_reader_panel == READER_PANEL_NONE && !s_toolbar && !s_clear_confirm;
-    const bool reader_entry=s_view==READING&&s_text&&s_presented_view!=(int)READING;
+    const bool reader_entry=s_view==READING&&s_text&&
+        (s_presented_view!=(int)READING||(s_presented_cache_card&&s_warm_chapter<0));
     const EpdRect body_area=reader_area();
     const bool separate_metadata=s_view==READING&&s_text&&
         s_reader_panel==READER_PANEL_NONE&&!s_toolbar&&!s_clear_confirm&&!s_reader_cleanup&&
@@ -5200,8 +5454,18 @@ static bool present_book_frame(app_ctx_t* ctx, app_redraw_t redraw) {
         ++s_du_count;
         s_du_ms = esp_timer_get_time() / 1000;
     } else s_du_count = 0;
-    ESP_LOGI(TAG, "present draw=%lld display=%lld join=%lld ms", (drawn - start) / 1000,
-             (displayed - drawn) / 1000, (esp_timer_get_time() - displayed) / 1000);
+    /*
+     * img= 是这一页真正画出来的插图张数，gray= 是这一帧走的是不是图文灰阶通路。
+     * 有图页必然整屏 GL16（原厂柔和翻页表），文字页走 1K 相位表快翻；把这两个数写在同一行，
+     * "带图翻页慢多少、慢在哪" 就不用再猜。
+     * img= is how many illustrations this page actually painted and gray= whether this frame took
+     * the grayscale image path. Image pages always drive a full-screen GL16 with the vendor soft
+     * turn while text pages use the 1K phase-LUT turn; putting both numbers on this line makes
+     * "how much slower is an image turn, and where" measurable instead of guessed.
+     */
+    ESP_LOGI(TAG, "present draw=%lld display=%lld join=%lld ms img=%d gray=%d", (drawn - start) / 1000,
+             (displayed - drawn) / 1000, (esp_timer_get_time() - displayed) / 1000,
+             s_view == READING ? s_page_image_count : 0, image_gray_refresh ? 1 : 0);
     guard_draw_result(ctx->hl, err);
     if ((s_view==SHELF || s_view==MANAGE || s_view==BULK) && err==EPD_DRAW_SUCCESS) {
         const bool whole_page = redraw == APP_REDRAW_PAGE || redraw == APP_REDRAW_FULL;
@@ -5233,6 +5497,7 @@ static bool present_book_frame(app_ctx_t* ctx, app_redraw_t redraw) {
     s_reader_image_refresh_pending = false;
     if(err==EPD_DRAW_SUCCESS) {
         s_presented_view=(int)s_view;
+        s_presented_cache_card = s_view==READING && s_warm_chapter>=0;
         if(reader_entry)s_turns=0;
     }
     s_reader_footer_pending=err==EPD_DRAW_SUCCESS&&separate_metadata;
@@ -5354,7 +5619,8 @@ static void flush_ticket_stats(void) {
 static void track_ticket_stats(app_ctx_t* ctx) {
 #if KIIKO_BOARD_METALIO47
     wr_reading_tick(s_view == READING && s_text && !s_toolbar &&
-                    ctx->now_ms-s_stats_activity_ms <= 300000,ctx->now_ms);
+                    ctx->now_ms-s_stats_activity_ms <= 300000,ctx->now_ms,
+                    (unsigned)s_chapter,(unsigned)reader_page_offset(s_page),(unsigned)percent(s_page));
 #endif
     if (s_view != READING || !s_text) { s_stats_last_ms = ctx->now_ms; return; }
     if (s_stats_last_ms > 0 && ctx->now_ms >= s_stats_last_ms &&
@@ -5369,6 +5635,14 @@ static void track_ticket_stats(app_ctx_t* ctx) {
 }
 static void free_book(void) {
 #if KIIKO_BOARD_METALIO47
+    /* 关书即停这本书的缓存任务：预取还在下这一本的章节时，worker 不会空出来，
+     * 打开下一本书只能被告知"请等待当前操作完成"，或者等待页一直等不到自己的章。
+     * 只针对这本书——换书时新书已经起来的预取不受影响。
+     * Closing the book stops its cache jobs: while a prefetch is still fetching this book's
+     * chapters the worker never frees up, so the next book either gets "wait for the current
+     * operation" or a waiting page that never sees its own chapter. Scoped to this book, so a
+     * prefetch already running for the newly opened book survives. */
+    wr_cache_pause(s_path);
     wr_reading_stop(true);
     reader_font_reload_cancel();
 #endif
@@ -5461,48 +5735,27 @@ static void release_page_images(void) {
     free(s_page_images); s_page_images = NULL; s_page_image_count = 0;
     s_page_images_for = SIZE_MAX;
 }
-static void prepare_inline_image(void) {
-    if (app_settings_reader_hide_images()) { release_page_images(); return; }
-    uint32_t generation = book_layout_generation();
-    if (s_page_images_for == s_page && s_page_images_generation == generation) return;
-    // 纯文字跨页不应作废已排好的下一页；布局代次改变或任一侧有插图时才失效。
-    // Preserve the prefetched next text page; invalidate only across layout generations or image-bearing pages.
-    const bool changed_layout_or_image = s_page_images_generation != generation || s_page_image_count > 0;
-    release_page_images();
-    s_page_images_for = s_page; s_page_images_generation = generation;
-    // 插图不显示没有别的症状，每条失败路径以前都是静默 continue；这里把结局记下来，
-    // 免得继续靠猜。
-    // A missing illustration has no other symptom and every failure path used to be a silent
-    // continue; record the outcome instead of guessing.
-    int count = reader_image_slots(s_page);
-    if (changed_layout_or_image || count > 0) invalidate_prep();
-#if KIIKO_BOARD_METALIO47
-    if(count>0){reader_page_cache_clear();s_next_fb=NULL;}
-#else
-#endif
-    size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!count || count > (int)HTML_TEXT_MAX_BLOCKS) {
-        ESP_LOGI(TAG, "inline page %u: %d image slots", (unsigned)s_page, count);
-        return;
+/* ------------------------------------------------------------------ */
+/* 页图缓存：解码后的灰阶位图，按（页，布局代次）存放                   */
+/* ------------------------------------------------------------------ */
+/* 结构与槽位声明在文件上方（预排要用），这里只放操作。 */
+/* The struct and slots are declared at the top (prefetch needs them); operations live here. */
+static int decode_page_images(size_t page, reader_image_t **out) {
+    if (out) *out = NULL;
+    int count = reader_image_slots(page);
+    if (count <= 0 || count > (int)HTML_TEXT_MAX_BLOCKS) return 0;
+    reader_image_t *images = heap_caps_calloc((size_t)count, sizeof(*images),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!images) {
+        ESP_LOGW(TAG, "page %u: no PSRAM for %d slots", (unsigned)page, count);
+        return 0;
     }
-    s_page_images = heap_caps_calloc((size_t)count, sizeof(*s_page_images), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_page_images) {
-        // 分配失败时计数必须跟着归零：release_page_images 会按计数遍历这张表。
-        // The count has to follow the table to zero: release_page_images walks it by count.
-        s_page_image_count = 0;
-        ESP_LOGW(TAG, "inline page %u: no PSRAM for %d slots", (unsigned)s_page, count);
-        return;
-    }
-    s_page_image_count = count;
-    // 逐张解码并立即释放压缩数据；全页灰阶位图的总面积不超过插图区域。
-    // Decode serially and release each encoded buffer; the page's bitmap area stays within its
-    // illustration region.
     EpdRect band = book_layout_image_rect();
     size_t pixels_left = (size_t)band.width * band.height;
     int decoded = 0;
     for (int i = 0; i < count; ++i) {
         int index = -1, width = 0, height = 0;
-        if (!reader_image_slot(s_page, i, &index, NULL, &width, &height) ||
+        if (!reader_image_slot(page, i, &index, NULL, &width, &height) ||
             index < 0 || (size_t)index >= s_image_count || width <= 0 || height <= 0) {
             ESP_LOGW(TAG, "inline %d: slot i=%d width=%d height=%d", i, index, width, height);
             continue;
@@ -5511,6 +5764,14 @@ static void prepare_inline_image(void) {
         esp_err_t err = book_chapter_image(s_chapter, s_images[index], &encoded, &size, &png);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "inline %d %s: read %s", i, s_images[index], esp_err_to_name(err));
+            /*
+             * 正文引用了盘上没有的插图：多半是旧版本断网时缓存的章（那时代码不登记待补清单）。
+             * 请缓存层重落这一章，每章只修一次。
+             * The body references an illustration the disk lacks — usually a chapter cached by an
+             * older build during an outage, when missing pictures were not queued. Ask the cache
+             * layer to stage it once more; each chapter is repaired only once.
+             */
+            if (err == ESP_ERR_NOT_FOUND) (void)wr_cache_repair(s_path, (unsigned)s_chapter);
             free(encoded);
             continue;
         }
@@ -5537,8 +5798,22 @@ static void prepare_inline_image(void) {
                 free(encoded);
                 continue;
             }
-            if (book_image_grayscale(encoded, size, png, width, height, gray)) {
-                s_page_images[i] = (reader_image_t){gray, width, height};
+            bool ok = book_image_grayscale(encoded, size, png, width, height, gray);
+            if (!ok) {
+                /*
+                 * 解码器在内部分配 rxlink 时失败（日志 no memory for jpeg decode rxlink），
+                 * 是"内部 RAM 刚好被别人占着"的瞬时状态，不是这张图坏了。让出 CPU 等那些
+                 * 缓冲释放，再试一次；两次都失败才认输。
+                 * The decoder failed to allocate its rxlink from internal RAM — a transient
+                 * shortage, not a broken picture. Yield so those buffers can be released and try
+                 * once more; only a second failure gives up.
+                 */
+                vTaskDelay(pdMS_TO_TICKS(120));
+                ok = book_image_grayscale(encoded, size, png, width, height, gray);
+                if (ok) ESP_LOGI(TAG, "inline %d: decoded on retry", i);
+            }
+            if (ok) {
+                images[i] = (reader_image_t){gray, width, height};
                 pixels_left -= pixels;
                 ++decoded;
             } else {
@@ -5551,14 +5826,42 @@ static void prepare_inline_image(void) {
         free(encoded);
         vTaskDelay(1);
     }
-    // 只在有图没画出来时汇总：插图缺失没有别的症状，而每次都打会把日志淹掉。
-    // Summary only when something did not make it: a missing illustration has no other symptom,
-    // and logging every page would drown the console.
-    if (decoded < count) {
-        ESP_LOGW(TAG, "inline page %u: %d/%d decoded, psram %u->%u KB", (unsigned)s_page, decoded, count,
-                 (unsigned)(psram_before / 1024),
-                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) / 1024));
+    if (!decoded) {
+        free(images);
+        return 0;
     }
+    if (decoded < count)
+        ESP_LOGW(TAG, "inline page %u: %d/%d decoded, psram %u KB free", (unsigned)page, decoded, count,
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) / 1024));
+    if (out) *out = images; else {
+        for (int i = 0; i < count; ++i) free(images[i].gray);
+        free(images);
+    }
+    return count;
+}
+static void prepare_inline_image(void) {
+    if (app_settings_reader_hide_images()) { release_page_images(); return; }
+    uint32_t generation = book_layout_generation();
+    if (s_page_images_for == s_page && s_page_images_generation == generation) return;
+    // 纯文字跨页不应作废已排好的下一页；布局代次改变或本页有插图时才失效。
+    // Preserve the prefetched next text page; invalidate across layout generations or an
+    // illustrated page.
+    const bool changed_layout_or_image = s_page_images_generation != generation || s_page_image_count > 0;
+    release_page_images();
+    s_page_images_for = s_page; s_page_images_generation = generation;
+    int count = reader_image_slots(s_page);
+    if (changed_layout_or_image || count > 0) invalidate_prep();
+#if KIIKO_BOARD_METALIO47
+    // 带图页不预排，所以这一页的帧缓存不该留：翻过去时反正要重新解图重画。
+    // Illustrated pages are not prefetched, so their frame must not stay cached: the turn will
+    // decode and repaint anyway.
+    if(count>0){reader_page_cache_clear();s_next_fb=NULL;}
+#endif
+    if (!count) {
+        ESP_LOGI(TAG, "inline page %u: %d image slots", (unsigned)s_page, count);
+        return;
+    }
+    s_page_image_count = decode_page_images(s_page, &s_page_images);
 }
 // 标题匹配要宽松：书内导航与正文的写法常常不同（"第一章 出发" 对 "出发"、"1. Prologue" 对
 // "序章"，竖排书尤其如此）。逐字比较失败时正文标题块不会被跳过，题头与正文就各显示一次。
@@ -5583,6 +5886,12 @@ static bool heading_text_matches(const char *text, const char *toc, const char *
 
 static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
                             bool last_page, const char *anchor, size_t source_offset) {
+    /* 目录里跳到的章，可能是开书之后才补下来的：先把书源条目从"占位"刷成"正文"。
+     * 不刷新就会读到占位正文——读者看到满页"正在缓存本章…"，却根本没有下载在跑。
+     * A chapter reached from the TOC may have landed after the book was opened: pull it into the
+     * source first. Without this the placeholder body is read — a page saying "正在缓存本章…"
+     * with no download running at all. */
+    (void)book_chapter_cache_refresh(chapter);
     bool clear_toc = chapter != s_chapter || (!anchor && source_offset == SIZE_MAX);
     html_text_t loaded = {0};
     size_t anchor_offset = 0;
@@ -5727,6 +6036,12 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
              (unsigned)uxTaskGetStackHighWaterMark(NULL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    /* 每进入一章都把"下一章"静默排上。预取只领先一章，靠这里在翻章时续上，
+     * 读者因此不会隔一章等一次缓存；非逐章书源这一句是空操作。
+     * Quietly queue the next chapter on every entry. The read-ahead is one chapter, and this is
+     * what keeps it rolling as the reader advances, so no every-other-chapter stall appears;
+     * for non-chapter sources this call is a no-op. */
+    (void)book_chapter_cache_request(chapter);
     return true;
 }
 static bool load_chapter(app_ctx_t* ctx, size_t chapter, size_t offset, bool last_page) {
@@ -5745,6 +6060,34 @@ static void skip_hidden_image_pages(app_ctx_t *ctx, int direction) {
         } else break;
     }
 }
+/*
+ * 目录跳转的公共实现：直接点、以及"下载完成后自动跳转"都走这里，避免两套跳转逻辑
+ * 在进度保存与锚点恢复上出现分歧。
+ * Shared TOC jump: a direct tap and the post-download auto jump both come through here, so
+ * progress saving and anchor restoration cannot diverge between two copies.
+ */
+static bool toc_open_target(app_ctx_t *ctx, int target) {
+    if (target < 0) return false;
+    size_t chapter = book_navigation_chapter((size_t)target);
+    if (chapter >= book_chapter_count()) return false;
+    save_progress();
+    set_reader_view(READING);
+    if (!load_chapter_at(ctx, chapter, 0, false, book_navigation_anchor((size_t)target),
+                         book_navigation_source_offset((size_t)target))) {
+        set_reader_view(s_text ? TOC : SHELF);
+        return false;
+    }
+    s_selected_toc = (size_t)target;
+    char entry_title[sizeof(s_title)];
+    if (book_navigation_title((size_t)target, entry_title, sizeof(entry_title)) == ESP_OK)
+        copy_text(s_title, sizeof(s_title), entry_title);
+    s_warm_chapter = -1;
+    s_view = READING;
+    s_reader_panel = READER_PANEL_NONE;
+    save_progress();
+    return true;
+}
+
 static bool open_book_impl(app_ctx_t* ctx, const char* path) {
     if (!book_file_path_supported(path)) {
         copy_text(s_message, sizeof(s_message), "此版本仅支持 TXT 和 EPUB 书籍");
@@ -5880,6 +6223,26 @@ static bool open_book_impl(app_ctx_t* ctx, const char* path) {
     skip_hidden_image_pages(ctx, 1);
     if (!s_text) { free_book(); return false; }
     s_view = READING;
+    /*
+     * 首开未缓存的书：先让等待页顶着，别把"正在缓存本章…"的占位正文当正文显示。
+     * 章节落盘后由 tick 换页，读者不需要退出重进。
+     * First open of an uncached book: hold a waiting page instead of showing the placeholder as
+     * if it were the text. The tick swaps in the real page once the chapter lands.
+     */
+    const book_ch_cache_t entry_state = book_chapter_cache_state(chapter);
+    s_warm_chapter = (entry_state == BOOK_CH_CACHE_MISSING || entry_state == BOOK_CH_CACHE_PENDING ||
+                      entry_state == BOOK_CH_CACHE_FAILED) ? (int)chapter : -1;
+    s_warm_enter = s_warm_chapter >= 0; // 进书本就是要读这一章：落盘后直接进正文
+    s_warm_offset = resume && p.chapter == chapter ? (size_t)p.byte_off : 0;
+    s_toc_download = -1;
+    s_cache_poll_ms = 0;
+    s_warm_start_ms = ctx->now_ms;
+    s_warm_failed = false;
+    s_warm_retry_ms = 0;
+    s_warm_retries = 0;
+    s_cache_shown_done = 0;
+    s_cache_shown_percent = 0;
+    if (s_warm_chapter >= 0) (void)book_chapter_cache_request(chapter);
     s_reader_image_refresh_pending = !app_settings_reader_hide_images() &&
         book_layout_page_image_count(s_page) > 0 && s_page_images;
     s_stats_last_ms = s_stats_activity_ms = ctx->now_ms;
@@ -5946,7 +6309,11 @@ static void cover_cache_warm_async(const char* path) {
     // Parse metadata on the calling thread; the background task never runs zip/xml parsing.
     (void)book_epub_metadata_cached(arg->path, arg->title, sizeof(arg->title),
                                     arg->author, sizeof(arg->author));
-    if (xTaskCreate(cover_warm_task, "cover_warm", 4096, arg, 1, NULL) != pdPASS) free(arg);
+    /* 4096 字节栈不够：标记文件（分章缓存书）解析不出封面时会走"生成默认封面"分支，
+     * 那里要用内置 TTF 渲染书名，实测直接把栈打爆并重启。与 covers/font 任务取同一档。
+     * 4 KB was not enough: a marker-only book has no parsable cover, so the job falls back to
+     * generating one, which renders the title with the built-in TTF and overflowed this stack. */
+    if (xTaskCreate(cover_warm_task, "cover_warm", 12288, arg, 1, NULL) != pdPASS) free(arg);
 }
 static bool open_book(app_ctx_t *ctx, const char *path) {
 #if KIIKO_BOARD_METALIO47
@@ -5971,7 +6338,15 @@ static bool open_book(app_ctx_t *ctx, const char *path) {
     pico_boot_book_end(ok);
 #if KIIKO_BOARD_METALIO47
     s_reader_return_weread = return_weread && ok;
-    if (ok) wr_reading_start(path,!offline && wr_online(),ctx->now_ms);
+    /*
+     * 只有"用户主动选了离线阅读"才不上报。不能在这里加 wr_online()：开书那一刻 Wi-Fi
+     * 还没连上的话，整场阅读的时长就被永久关掉了，之后联网也不会补。
+     * 计时与断网补发由 wr_reading_tick / run_report 各自处理。
+     * Only an explicit offline read disables reporting. Do not gate on wr_online() here: a
+     * Wi-Fi hiccup at open time would silently disable the whole session, and reconnecting
+     * could never bring it back. Accumulation and catch-up are handled downstream.
+     */
+    if (ok) wr_reading_start(path, !offline, ctx->now_ms);
 #endif
     if (ok) cover_cache_warm_async(s_path);
     return ok;
@@ -6705,6 +7080,12 @@ static void manage_apply(app_ctx_t* ctx) {
         bool removed = false;
         err = book_store_delete(s_managed.path, &removed);
         if (removed) {
+            /* 微读书籍的章节缓存不在书籍文件里，删除文件后必须单独回收，否则微读书架
+             * 仍显示"已缓存 N/M"，SD 卡上还留着整本书的章节。
+             * A WeRead book's chapter cache is not inside the book file, so deleting the file
+             * has to reclaim it separately; otherwise the WeRead shelf keeps claiming
+             * "cached N/M" while the card still holds every chapter. */
+            (void)wr_forget_book(s_managed.path);
             retry->entry.removed = true;
             s_file_removed = true;
             pending_discard(s_managed.path);
@@ -6751,6 +7132,10 @@ static bool reader_turn_chrome(app_ctx_t *ctx) {
 static app_redraw_t turn_page(app_ctx_t* ctx, int dir) {
     if(!s_rc_auto_turning)rc_pause_auto();
     if (!s_text || s_clear_confirm) return APP_REDRAW_NONE;
+    // 等待页上翻页没有意义：底下是占位正文或上一章，翻出来的页码会被落盘后的重排推翻。
+    // Turning means nothing on the waiting page: the rows below are a placeholder or the previous
+    // chapter, and any page it lands on is discarded when the real chapter lays out.
+    if (s_warm_chapter >= 0 || s_toc_download >= 0) return APP_REDRAW_NONE;
     reader_zoom_reset();
 #if KIIKO_BOARD_METALIO47
     s_turn_direction=dir;
@@ -6765,9 +7150,16 @@ static app_redraw_t turn_page(app_ctx_t* ctx, int dir) {
     bool changed = true;
     if (dir > 0 && s_page + 1 < book_layout_page_count()) ++s_page;
     else if (dir < 0 && s_page) --s_page;
-    else if (dir > 0 && s_chapter + 1 < book_chapter_count()) { save_progress(); changed = load_chapter(ctx, s_chapter + 1, 0, false); }
-    else if (dir < 0 && s_chapter) { save_progress(); changed = load_chapter(ctx, s_chapter - 1, 0, true); }
-    else return reader_turn_chrome(ctx) ? APP_REDRAW_PAGE : APP_REDRAW_NONE;
+    else if (dir > 0 && s_chapter + 1 < book_chapter_count()) {
+        // 下一章还没落盘：停在原页等它，别先翻到占位正文上。
+        // The next chapter is not local yet: hold this page and wait instead of landing on the
+        // placeholder body.
+        if (wait_for_chapter(ctx, s_chapter + 1, 1)) return APP_REDRAW_PAGE;
+        save_progress(); changed = load_chapter(ctx, s_chapter + 1, 0, false);
+    } else if (dir < 0 && s_chapter) {
+        if (wait_for_chapter(ctx, s_chapter - 1, -1)) return APP_REDRAW_PAGE;
+        save_progress(); changed = load_chapter(ctx, s_chapter - 1, 0, true);
+    } else return reader_turn_chrome(ctx) ? APP_REDRAW_PAGE : APP_REDRAW_NONE;
     if (!changed) { set_reader_view(s_text ? TOC : SHELF); ctx->leaf = s_text ? book_toc_open(current_toc_position()) : 0; return APP_REDRAW_PAGE; }
     skip_hidden_image_pages(ctx, dir);
     if (!s_text) { s_view = SHELF; return APP_REDRAW_PAGE; }
@@ -7922,6 +8314,7 @@ static void batch_apply(app_ctx_t* ctx) {
                     bool removed = false;
                     err = book_store_delete(item.path, &removed);
                     if (removed) {
+                        (void)wr_forget_book(item.path); // 章节缓存不在书籍文件里，单独回收
                         retry->entry.removed = true;
                         item.removed = true; pending_discard(item.path);
                         book_store_notify_changed(); s_store_revision = book_store_revision();
@@ -8187,6 +8580,14 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
         return APP_REDRAW_NONE;
     }
     if (s_view == TOC) {
+        /*
+         * 卡片盖着整屏时，底下的目录行不该再吃点击：读者点的是卡片，命中的却是某一行，
+         * 会当场跳到一章风马牛不相及的地方。返回键仍然可用（卡片上就是这么写的）。
+         * While the card covers the screen the rows underneath must not take taps: the reader
+         * aims at the card and would hit whatever row is under the finger. The back key still
+         * works, which is what the card says.
+         */
+        if (s_toc_download >= 0) return APP_REDRAW_NONE;
         if (s_toc_jump_open) {
             int choice = book_toc_jump_hit(x, y);
             if (choice == BOOK_TOC_JUMP_TRACK) {
@@ -8202,6 +8603,7 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
         if (target == BOOK_TOC_BACK) {
             if (book_toc_picker_close(&ctx->leaf)) return APP_REDRAW_PAGE;
             s_message[0] = 0;
+            s_toc_download = -1; // 退回正文即视为放弃这次跳转
             set_reader_view(READING);
             s_reader_panel = READER_PANEL_NONE;
             return APP_REDRAW_PAGE;
@@ -8223,21 +8625,29 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
             return APP_REDRAW_PAGE;
         }
         if (!s_message[0] && book_toc_toggle(target, &ctx->leaf)) return APP_REDRAW_PAGE;
-        if (target >= 0 && !s_message[0]) {
+        if (target >= 0) {
             size_t chapter = book_navigation_chapter((size_t)target);
             if (chapter >= book_chapter_count()) return APP_REDRAW_NONE;
-            save_progress();
-            set_reader_view(READING);
-            if (load_chapter_at(ctx, chapter, 0, false, book_navigation_anchor((size_t)target),
-                                book_navigation_source_offset((size_t)target))) {
-                s_selected_toc = (size_t)target;
-                char entry_title[sizeof(s_title)];
-                if (book_navigation_title((size_t)target, entry_title, sizeof(entry_title)) == ESP_OK)
-                    copy_text(s_title, sizeof(s_title), entry_title);
-                s_view = READING;
-                s_reader_panel = READER_PANEL_NONE;
-                save_progress();
-            } else set_reader_view(s_text ? TOC : SHELF);
+            /*
+             * 未缓存的章先下载再跳：点一下就给结果，不让读者自己"先缓存再回来"。
+             * 已缓存（或不是逐章书源）照旧立即跳转。提示语显示期间仍然接受点击，
+             * 否则一次下载失败就把整个目录锁住，只能退回重进。
+             * An uncached chapter downloads first and then opens, so one tap is enough; cached
+             * chapters and non-chapter sources keep jumping immediately. Taps stay live while
+             * the hint shows, otherwise one failed download would lock the whole TOC.
+             */
+            const book_ch_cache_t state = book_chapter_cache_state(chapter);
+            if (state != BOOK_CH_CACHE_READY && state != BOOK_CH_CACHE_UNKNOWN &&
+                book_chapter_cache_request(chapter)) {
+                s_toc_download = target;
+                s_toc_download_chapter = chapter;
+                s_cache_poll_ms = 0;
+                s_toc_download_ms = ctx->now_ms;
+                copy_text(s_message, sizeof(s_message), "正在缓存本章，完成后自动打开…");
+                return APP_REDRAW_PAGE;
+            }
+            if (s_message[0]) return APP_REDRAW_NONE;
+            toc_open_target(ctx, target);
             return APP_REDRAW_PAGE;
         }
         return APP_REDRAW_NONE;
@@ -8254,6 +8664,17 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
         return APP_REDRAW_NONE;
     }
     if (s_view == READING) {
+        /*
+         * 等待页不是正文：卡片盖着整屏，底下却是上一章/占位章的行，点到的坐标属于一个
+         * 还不存在的版式。这里吞掉所有点击——否则一次点击会悄悄打开工具栏或设置面板，
+         * 等章节落地、正文换上来的那一刻，读者会看到一条莫名其妙的底部导航栏。
+         * The waiting page is not text: the card covers the screen while the rows underneath
+         * belong to the previous or placeholder chapter, so every coordinate lands on a layout
+         * that is not on screen. Swallow taps — otherwise one tap silently opens the tools or a
+         * settings panel, and the moment the real text arrives the reader is handed a bottom
+         * navigation bar they never asked for.
+         */
+        if (s_warm_chapter >= 0) return APP_REDRAW_NONE;
         bool header_handled;
         app_redraw_t header_redraw=reader_header_action(ctx,x,y,&header_handled);
         if(header_handled)return header_redraw;
@@ -9238,6 +9659,14 @@ static app_redraw_t on_key(app_ctx_t* ctx, int key) {
     s_pressed_control = -1;
     if((s_view==SHELF||s_view==BULK)&&s_sort_menu){s_sort_menu=false;return APP_REDRAW_PAGE;}
     if (s_view == TOC && key == UI_KEY_2 && book_toc_picker_close(&ctx->leaf)) return APP_REDRAW_PAGE;
+    if (s_view == TOC && s_toc_download >= 0 && key == UI_KEY_2) {
+        /* 短按返回放弃这次跳转：等待卡片不能把读者卡在目录上。
+         * A short press gives up the jump; the waiting card must never trap the reader on the TOC. */
+        s_toc_download = -1;
+        s_message[0] = 0;
+        set_reader_view(READING);
+        return APP_REDRAW_PAGE;
+    }
     if (s_view == TOC && s_toc_jump_open) {
         if (key == UI_KEY_2) s_toc_jump_open = s_toc_jump_drag = false;
         else if (key == UI_KEY_1 || key == UI_KEY_3) {

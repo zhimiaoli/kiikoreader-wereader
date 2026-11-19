@@ -932,32 +932,33 @@ static esp_err_t sync_time_impl(uint32_t *utc_seconds) {
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     init.nvs_enable = false; // 与原厂S31一致；凭据只由本设备设置区管理。/ Reference S31 RAM-only driver config.
     transfer_s31_constrained_sta_config(&init);
-    /* NTP 只发几个小包，静态 TX 池同样可以压缩：驱动把这池当一整块连续 DMA 申请。
-     * NTP only sends a few small packets, so the static TX pool can shrink: the driver
-     * requests it as one contiguous DMA block. */
-    if (init.static_tx_buf_num > 3) init.static_tx_buf_num = 3;
-    ESP_LOGI("time_sync", "temporary Wi-Fi rx profile static=%d dynamic=%d ampdu=%d tx=%d dma_free=%u dma_largest=%u",
-             init.static_rx_buf_num, init.dynamic_rx_buf_num, init.ampdu_rx_enable, init.static_tx_buf_num,
+    ESP_LOGI("time_sync", "temporary Wi-Fi rx profile static=%d dynamic=%d ampdu=%d dma_free=%u dma_largest=%u",
+             init.static_rx_buf_num, init.dynamic_rx_buf_num, init.ampdu_rx_enable,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-    /* 静态 RX 缓冲必须来自一块连续的 DMA 内部内存。阅读页打开时面板缓冲会把这块吃到只剩
-     * 几千字节，此时强行初始化不但失败，还会把驱动留在半初始化状态——之后的传书、缓存
-     * 全部起不来（表现为"无法连接 Wi-Fi"）。所以这里先等一小会儿，凑不够就直接跳过这次对时。
-     * Static RX buffers need one contiguous internal DMA block. With the reader page open the
-     * panel buffer leaves only a few KB free; forcing init there fails and leaves the driver
-     * half-initialised, which breaks every later session. Wait briefly, then skip. */
-    for (int wait = 0; wait < 12; ++wait) {
-        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) >= 8u * 1024u) break;
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) < 8u * 1024u) {
-        ESP_LOGW("time_sync", "skip: dma largest=%u <8KB, ui holds the block",
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-        err = ESP_ERR_NO_MEM;
-        goto time_cleanup;
-    }
     stage="wifi-init";
-    err = esp_wifi_init(&init); if (err != ESP_OK) goto time_cleanup;
+    /*
+     * 开机早期这条临时对时以前只有一次机会，日志里那句
+     * "time_sync: temporary stage=wifi-init result=ESP_ERR_NO_MEM" 就是它：
+     * 内部堆正卡在 65–70 KB，3 个静态 RX 缓冲差一块。这里和主连接路径一样先降档再重试。
+     * This early-boot time-sync session used to get one shot, and the boot log line
+     * "time_sync: temporary stage=wifi-init result=ESP_ERR_NO_MEM" is exactly that: the internal
+     * heap sits at 65–70 KB and the third static RX buffer does not fit. Step down and retry, as
+     * the main connect path now does.
+     */
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 72u * 1024u)
+        transfer_s31_slim_sta_config(&init, 1);
+    err = esp_wifi_init(&init);
+    for (int retry = 0; err != ESP_OK && retry < 2; ++retry) {
+        ESP_LOGW("time_sync", "temporary wifi init retry=%d err=%s internal free=%u",
+                 retry + 1, esp_err_to_name(err),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        (void)esp_wifi_deinit();
+        transfer_s31_slim_sta_config(&init, retry + 2);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        err = esp_wifi_init(&init);
+    }
+    if (err != ESP_OK) goto time_cleanup;
     wifi_initialized = true;
     err = esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
                                                time_wifi_event, NULL, &wifi_handler);
@@ -1079,18 +1080,29 @@ esp_err_t read_pico_transfer_scan_wifi(read_pico_transfer_network_t out[READ_PIC
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     init.nvs_enable = false; // 与原厂S31一致；凭据只由本设备设置区管理。/ Reference S31 RAM-only driver config.
     transfer_s31_constrained_sta_config(&init);
-    /* 扫描只收信标，不需要一整套静态 TX 缓冲；而驱动把静态缓冲池作为一整块连续
-     * DMA 内存申请，内部 RAM 碎片化时就是这一步失败（esf_buf_setup_static）。
-     * 只在本函数内压低，传书服务的吞吐配置不受影响。
-     * A scan only receives beacons, so it does not need the full static TX pool: the
-     * driver requests that pool as one contiguous DMA block, and that allocation is
-     * what fails under internal-RAM fragmentation. Local to this function so the
-     * transfer service keeps its throughput profile. */
-    if (init.static_tx_buf_num > 3) init.static_tx_buf_num = 3;
-    ESP_LOGI("transfer", "wifi scan rx profile static=%d dynamic=%d ampdu=%d tx=%d",
-             init.static_rx_buf_num, init.dynamic_rx_buf_num, init.ampdu_rx_enable, init.static_tx_buf_num);
+    ESP_LOGI("transfer", "wifi scan rx profile static=%d dynamic=%d ampdu=%d",
+             init.static_rx_buf_num, init.dynamic_rx_buf_num, init.ampdu_rx_enable);
     stage = "wifi-init";
-    err = esp_wifi_init(&init); if (err != ESP_OK) goto cleanup;
+    /*
+     * 余量只有七十几 KB 时先降一档；失败再逐级降。以前这里只试一次就放弃，扫不到网络的
+     * 提示就是这么来的——同一时刻连接路径能过、扫描路径过不去，因为两者差一块静态缓冲。
+     * Step down first when headroom is short, and further on failure. This used to try once and
+     * give up, which is where "network scan failed" came from: at the same moment the connect path
+     * squeaked through while the scan path did not, one static buffer apart.
+     */
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 72u * 1024u)
+        transfer_s31_slim_sta_config(&init, 1);
+    err = esp_wifi_init(&init);
+    for (int retry = 0; err != ESP_OK && retry < 2; ++retry) {
+        ESP_LOGW("transfer", "wifi scan init retry=%d err=%s internal free=%u",
+                 retry + 1, esp_err_to_name(err),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        (void)esp_wifi_deinit();
+        transfer_s31_slim_sta_config(&init, retry + 2);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        err = esp_wifi_init(&init);
+    }
+    if (err != ESP_OK) goto cleanup;
     initialized = true;
     stage = "wifi-storage";
     err = esp_wifi_set_storage(WIFI_STORAGE_RAM); if (err != ESP_OK) goto cleanup;
@@ -1258,9 +1270,13 @@ static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (event->esp_netif != s_netif) return;
     char url[64]; snprintf(url, sizeof(url), "http://" IPSTR, IP2STR(&event->ip_info.ip));
     portENTER_CRITICAL(&s_lock);
-    bool accepted = !s_stopping && !s_connection.failed;
+    // 退避期里自发的 GOT_IP 也要收：链路自己回来了，没有理由把它当成失败态丢掉。
+    // Accept a spontaneous GOT_IP even while backing off: the link came back by itself, and
+    // there is no reason to discard it because the previous round was given up.
+    bool accepted = !s_stopping;
     if (accepted) {
         s_connection.online = true; s_connection.pending = false;
+        s_connection.failed = false; s_connection.rounds = 0; s_connection.retry_ms = 0;
         s_status.network_ready = true; strcpy(s_status.url, url);
         s_status.last_error = ESP_OK;
         if (s_status.state != READ_PICO_TRANSFER_UPLOADING) s_status.state = READ_PICO_TRANSFER_READY;
@@ -2250,7 +2266,19 @@ void read_pico_transfer_stop(void) {
     if (s_started) { esp_wifi_stop(); s_started = false; }
     if (s_events) { esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_events); s_events = NULL; }
     if (s_ip_events) { esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, s_ip_events); s_ip_events = NULL; }
-    if (s_wifi) { esp_wifi_deinit(); s_wifi = false; }
+    /*
+     * s_wifi 只在 init 成功后置位，所以"init 失败后收尾"这条路以前完全跳过 deinit，半初始化
+     * 的驱动把已经拿到的静态缓冲留在内部堆里不走——实测三次失败后再扫描，内部堆只剩 61.7 KB，
+     * 一块缓冲都拿不到。这里改成一律尝试回收（驱动从未起来时返回 ESP_ERR_WIFI_NOT_INIT，无害）。
+     * s_wifi is only set after a successful init, so the "clean up after a failed init" path skipped
+     * deinit entirely and the half-initialised driver kept its static buffers in the internal heap
+     * — measured 61.7 KB left after three failed attempts, not enough for even one buffer. Always
+     * attempt the release; on a driver that never came up it returns ESP_ERR_WIFI_NOT_INIT.
+     */
+    esp_err_t deinit_err = esp_wifi_deinit();
+    if (s_wifi && deinit_err != ESP_OK)
+        ESP_LOGW("transfer", "wifi deinit: %s", esp_err_to_name(deinit_err));
+    s_wifi = false;
     if (s_netif) { esp_netif_destroy_default_wifi(s_netif); s_netif = NULL; }
     if (s_loop_owned) { esp_event_loop_delete_default(); s_loop_owned = false; }
     free(s_buffer); s_buffer = NULL; s_buffer_capacity = 0;
@@ -2331,11 +2359,33 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
     // WiFi 静态RX缓冲需要连续的 DMA 可见内部内存；只看 free 不够，DMA 最大块也必须够。
     // Static WiFi RX buffers need a contiguous DMA-capable internal block, so bound that too.
     const size_t min_dma_largest = 16u * 1024u;
-    const int64_t wait_deadline = esp_timer_get_time() + INT64_C(4000000);
+    /* 等 4 秒没有意义：这块板常驻余量只有 65–75 KB，92 KB 永远不会出现，白白让每次联网晚
+     * 4 秒。等待只为"让正在收尾的会话彻底放手"，1.5 秒足够；真正的余量问题交给下面的
+     * 瘦身档位解决。
+     * Waiting 4 s buys nothing: this board sits at 65–75 KB, 92 KB never arrives, and every
+     * network bring-up paid four extra seconds for it. The wait only has to let a session that
+     * is finishing release its memory, so 1.5 s suffices; the real shortfall is handled by the
+     * slim profile below. */
+    const int64_t wait_deadline = esp_timer_get_time() + INT64_C(1500000);
+    /*
+     * 只在"内存还在变"时等：有人正在收尾（对时、云端同步）时内部堆会一路上涨，值得等它放完；
+     * 而这块板常态只有 65–75 KB，92 KB 永远不会出现，死等只是把每次联网都拖慢。
+     * 连续三次采样不变就说明没人会还内存了，直接往下走，余量不足交给瘦身档位。
+     * Wait only while the figure is still moving: when a session is finishing (time sync, cloud
+     * sync) the internal heap climbs and waiting pays off. This board normally sits at 65–75 KB,
+     * 92 KB never arrives, and waiting for it only made every bring-up slower. Three identical
+     * samples mean nobody is about to return memory — go ahead and let the slim profile cope.
+     */
+    size_t last_free = SIZE_MAX;
+    int steady = 0;
     while ((heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < min_internal ||
             heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < min_largest ||
             heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) < min_dma_largest) &&
            esp_timer_get_time() < wait_deadline) {
+        const size_t now_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        steady = now_free == last_free ? steady + 1 : 0;
+        last_free = now_free;
+        if (steady >= 3) break;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     const size_t pre_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -2351,39 +2401,27 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
     // crashed the radio library or looped on ASSOC_FAIL; with BLE kept on only ~90 KB is free
     // before transfer, so require 128 KB and enable the larger pool only when memory is ample.
     const bool bulk_rx = !cfg->network_only && pre_internal >= 128u * 1024u;
-    // 微信读书缓存是 network_only 的长时间大包下载，按内部 DMA 余量分两档：
-    //   主用档 —— 3 静态 RX + 3 静态 TX + 64 动态 RX，实测 351.6 KB/s（链路已满）
-    //   受限档 —— 上游原来的最小配置，仅作最后兜底
-    // WeRead caching (network_only) is a long bulk download. Two profiles, chosen by the
-    // internal DMA budget: the primary one (3 static RX/TX + 64 dynamic RX, measured at
-    // 351.6 KB/s) and the upstream constrained minimum as the last resort.
-    const bool thrifty_sta = cfg->network_only &&
-        cfg->mode == READ_PICO_TRANSFER_MODE_STA;
-    const bool constrained_sta = !thrifty_sta &&
-        cfg->mode == READ_PICO_TRANSFER_MODE_STA &&
+    const bool constrained_sta = cfg->mode == READ_PICO_TRANSFER_MODE_STA &&
         (pre_internal < min_internal || pre_dma_largest < min_dma_largest);
-    ESP_LOGI("transfer", "wifi pre-init internal free=%u largest=%u dma free=%u largest=%u bulk=%d constrained_sta=%d thrifty_sta=%d",
+    ESP_LOGI("transfer", "wifi pre-init internal free=%u largest=%u dma free=%u largest=%u bulk=%d constrained_sta=%d",
              (unsigned)pre_internal, (unsigned)pre_largest,
-             (unsigned)pre_dma_free, (unsigned)pre_dma_largest, (int)bulk_rx, (int)constrained_sta,
-             (int)thrifty_sta);
-    if (thrifty_sta) transfer_s31_thrifty_sta_config(&init);
-    else if (constrained_sta) transfer_s31_constrained_sta_config(&init);
+             (unsigned)pre_dma_free, (unsigned)pre_dma_largest, (int)bulk_rx, (int)constrained_sta);
+    if (constrained_sta) transfer_s31_constrained_sta_config(&init);
     else transfer_s31_bulk_receive_config(&init, bulk_rx);
-    /* 静态缓冲要占连续 DMA 内部内存。阅读页打开时这块被面板缓冲吃掉，强行初始化会失败并
-     * 把驱动留在半初始化状态，之后所有 Wi-Fi 会话都起不来。先等一会儿，凑不够就明确报错。
-     * Static buffers need a contiguous internal DMA block; with the reader page open it is gone.
-     * Forcing init there poisons the driver, so wait, then fail with a clear message. */
-    for (int wait = 0; wait < 20; ++wait) {
-        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) >= 8u * 1024u) break;
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) < 8u * 1024u) {
-        ESP_LOGW("transfer", "wifi start skipped: dma largest=%u free=%u internal=%u",
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        err = ESP_ERR_NO_MEM;
-        goto fail;
+    /*
+     * 余量只有七十几 KB 时，3 个静态 RX 缓冲就是那道坎：实测 68,599 B 能过、67,063 B 差一块。
+     * 与其硬闯一次失败、把驱动留在半初始化状态（之后同一份配置重试连一块都拿不到，扫描和
+     * 取目录就全挂了），不如先按实测余量降一档。
+     * Around 70 KB the third static RX buffer is exactly the cliff: 68,599 B passed and 67,063 B
+     * missed by one. Rather than fail once and leave the driver half-initialised — after which the
+     * identical config cannot get even one buffer, taking scans and TOC fetches down with it — step
+     * the pool down first when the measured headroom is short.
+     */
+    if (constrained_sta && pre_internal < 72u * 1024u) {
+        transfer_s31_slim_sta_config(&init, 1);
+        ESP_LOGW("transfer", "wifi slim profile static=%d dynamic=%d mgmt=%d internal=%u",
+                 init.static_rx_buf_num, init.dynamic_rx_buf_num, init.mgmt_sbuf_num,
+                 (unsigned)pre_internal);
     }
     err = esp_wifi_init(&init);
     for (int retry = 0; err != ESP_OK && retry < 3; ++retry) {
@@ -2392,23 +2430,15 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         (void)esp_wifi_deinit();
-        vTaskDelay(pdMS_TO_TICKS(250));
-        if (retry == 0) {
-            /* 初始化失败说明当前档位的静态缓冲申请不到，按档位往下退一步再试。
-             * A failed init means the current profile cannot allocate its static buffers;
-             * step one profile down and retry. */
-            wifi_init_config_t fallback = WIFI_INIT_CONFIG_DEFAULT();
-            fallback.nvs_enable = false;
-            ESP_LOGW("transfer", "wifi thrifty profile failed, falling back to constrained");
-            transfer_s31_constrained_sta_config(&fallback);
-            init = fallback;
-        }
+        /* 每轮都要更小：同一份配置重试只会连第一块都拿不到。/ Each retry must ask for less. */
+        transfer_s31_slim_sta_config(&init, retry + 2);
+        ESP_LOGW("transfer", "wifi slim profile level=%d static=%d dynamic=%d tx=%d mgmt=%d",
+                 retry + 2, init.static_rx_buf_num, init.dynamic_rx_buf_num,
+                 init.static_tx_buf_num, init.mgmt_sbuf_num);
+        vTaskDelay(pdMS_TO_TICKS(300));
         err = esp_wifi_init(&init);
     }
     if (err != ESP_OK) goto fail;
-    ESP_LOGI("transfer", "wifi rx profile active static_rx=%d static_tx=%d dynamic_rx=%d ampdu=%d ba=%d",
-             init.static_rx_buf_num, init.static_tx_buf_num, init.dynamic_rx_buf_num,
-             (int)init.ampdu_rx_enable, init.rx_ba_win);
     s_wifi = true;
     s_active_static_rx = init.static_rx_buf_num;
     s_active_rx_ba = init.rx_ba_win;
@@ -2515,7 +2545,7 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
         ESP_LOGI("transfer", "ap ready url=%s", READ_PICO_TRANSFER_URL);
     } else {
         int64_t now = esp_timer_get_time() / 1000;
-        portENTER_CRITICAL(&s_lock); connection_begin(&s_connection, now); portEXIT_CRITICAL(&s_lock);
+        portENTER_CRITICAL(&s_lock); connection_reset(&s_connection, now); portEXIT_CRITICAL(&s_lock);
         read_pico_transfer_service_poll();
     }
     release_config();
@@ -3083,9 +3113,13 @@ static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (event->esp_netif != s_netif) return;
     char url[64]; snprintf(url, sizeof(url), "http://" IPSTR, IP2STR(&event->ip_info.ip));
     portENTER_CRITICAL(&s_lock);
-    bool accepted = !s_stopping && !s_connection.failed;
+    // 退避期里自发的 GOT_IP 也要收：链路自己回来了，没有理由把它当成失败态丢掉。
+    // Accept a spontaneous GOT_IP even while backing off: the link came back by itself, and
+    // there is no reason to discard it because the previous round was given up.
+    bool accepted = !s_stopping;
     if (accepted) {
         s_connection.online = true; s_connection.pending = false;
+        s_connection.failed = false; s_connection.rounds = 0; s_connection.retry_ms = 0;
         s_status.network_ready = true; strcpy(s_status.url, url);
         s_status.last_error = ESP_OK;
         if (s_status.state != READ_PICO_TRANSFER_UPLOADING) s_status.state = READ_PICO_TRANSFER_READY;
@@ -3998,7 +4032,19 @@ void read_pico_transfer_stop(void) {
     if (s_started) { esp_wifi_stop(); s_started = false; }
     if (s_events) { esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_events); s_events = NULL; }
     if (s_ip_events) { esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, s_ip_events); s_ip_events = NULL; }
-    if (s_wifi) { esp_wifi_deinit(); s_wifi = false; }
+    /*
+     * s_wifi 只在 init 成功后置位，所以"init 失败后收尾"这条路以前完全跳过 deinit，半初始化
+     * 的驱动把已经拿到的静态缓冲留在内部堆里不走——实测三次失败后再扫描，内部堆只剩 61.7 KB，
+     * 一块缓冲都拿不到。这里改成一律尝试回收（驱动从未起来时返回 ESP_ERR_WIFI_NOT_INIT，无害）。
+     * s_wifi is only set after a successful init, so the "clean up after a failed init" path skipped
+     * deinit entirely and the half-initialised driver kept its static buffers in the internal heap
+     * — measured 61.7 KB left after three failed attempts, not enough for even one buffer. Always
+     * attempt the release; on a driver that never came up it returns ESP_ERR_WIFI_NOT_INIT.
+     */
+    esp_err_t deinit_err = esp_wifi_deinit();
+    if (s_wifi && deinit_err != ESP_OK)
+        ESP_LOGW("transfer", "wifi deinit: %s", esp_err_to_name(deinit_err));
+    s_wifi = false;
     if (s_netif) { esp_netif_destroy_default_wifi(s_netif); s_netif = NULL; }
     if (s_loop_owned) { esp_event_loop_delete_default(); s_loop_owned = false; }
     free(s_buffer); s_buffer = NULL;
@@ -4150,7 +4196,7 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
         ESP_LOGI("transfer", "ap ready url=%s", READ_PICO_TRANSFER_URL);
     } else {
         int64_t now = esp_timer_get_time() / 1000;
-        portENTER_CRITICAL(&s_lock); connection_begin(&s_connection, now); portEXIT_CRITICAL(&s_lock);
+        portENTER_CRITICAL(&s_lock); connection_reset(&s_connection, now); portEXIT_CRITICAL(&s_lock);
         read_pico_transfer_service_poll();
     }
     release_config();

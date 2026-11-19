@@ -9,8 +9,6 @@
 #include "app_transfer_mode.h"
 #include "book_cover.h"
 #include "book_store.h"
-#include "display.h"
-#include "e0470_epaper_waveform.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -21,57 +19,57 @@
 #include "ui_root_style.h"
 #include "ui_wifi_qr.h"
 #include "weread.h"
+#include "weread_cache.h"
 
 extern const app_desc_t app_book, app_transfer;
 
-typedef enum { SHELF, ACCOUNT, ACTIONS, LOGOUT, ASK_WIFI, WORK } wr_view_t;
+typedef enum { SHELF, ACCOUNT, ACTIONS, LOGOUT, ASK_WIFI, WORK, CONFIRM_DEL } wr_view_t;
+#define WR_TAG "WEREAD"
 /* 书架槽位由样式决定：网格 9、列表 8。数组按上限开，用前先夹紧，改样式不会越界。 */
 #define WR_SLOTS 9
 static wr_view_t s_view;
 static wr_job_t s_job, s_after_wifi;
 static bool s_wait_wifi, s_wifi_open, s_from_home, s_back_to_weread, s_return_once;
+/*
+ * "网络未连接，要不要连一下"这张卡片：读者点了阅读/缓存，但这本书还没落到本地书架、目录也只能
+ * 从云端取，离线时那条路必然失败。以前直接去取，取不到就报"获取目录失败"，读者不知道要连网。
+ * s_open_after_wifi 记住"连上之后把刚才那次打开补上"。
+ * The "no network — connect?" sheet: the reader asked to read or cache, but the book is not on the
+ * local shelf yet and its TOC only lives in the cloud, so an offline attempt cannot succeed. It
+ * used to try anyway and report "TOC fetch failed", which never said "you are offline".
+ * s_open_after_wifi remembers to resume the open once the link is up.
+ */
+static bool s_ask_connect, s_open_after_wifi;
+/* 连接倒计时的起点：卡片上写着"正在连接 Wi-Fi…"，可它不会自己结束。20 秒还没连上就把按钮
+ * 放回来，读者能再试一次或取消，而不是盯着一句永远不变的提示。
+ * Start of the connect countdown: the sheet says "connecting…" and never ends by itself. After
+ * 20 s with no link the buttons come back so the reader can retry or cancel instead of staring at
+ * a message that never changes. */
+static int64_t s_wifi_wait_ms;
+static app_redraw_t open_selected(app_ctx_t *ctx);
 static bool s_check_pending;
 static int64_t s_session_verified_us;
 static int s_page, s_count;
 static unsigned s_selected_index;
 static wr_book_t s_books[WR_SLOTS], s_selected;
-static bool s_cached[WR_SLOTS], s_selected_cached, s_logged;
+/*
+ * 书架的缓存状态不再只有"有/没有"两档：分章缓存的书可能只下了一部分。
+ * 逐本逐章 stat 太重，所以读后台维护的概况文件（已就绪章数 / 全书章数）。
+ * The shelf no longer has just cached/not-cached: a chapter-cached book may be partial.
+ * Per-chapter stat() is too heavy, so read the summary the background job maintains.
+ */
+typedef enum { WR_SHELF_NONE = 0, WR_SHELF_FULL, WR_SHELF_PARTIAL } wr_shelf_cache_t;
+static wr_shelf_cache_t s_cache_kind[WR_SLOTS];
+static unsigned s_cache_ready[WR_SLOTS], s_cache_total[WR_SLOTS];
+static bool s_selected_full, s_logged;
 static int s_pressed = -1;          /* 0 同步 / 1 账户：右上控件的按下反馈 */
 static int64_t s_pressed_until;
 static int s_pending_action = -1;   /* 按下反馈画完后要执行的动作 */
 static wr_job_t s_retry_job;        /* 失败后允许一键重试的动作 */
 static bool s_has_retry;
-static char s_open[WR_PATH], s_offline[WR_PATH], s_qr[180];
-static const char *s_message;
+static char s_open[WR_PATH], s_offline[WR_PATH], s_qr[180];static const char *s_message;
 static uint8_t *s_cover_pixels;
 static unsigned s_done, s_total;
-/* ============================ 缓存进度刷新的两档实现 ============================
- * WR_PROGRESS_AREA 0 —— 81.5 s 基线档：进度跨 5% 返回 APP_REDRAW_PAGE，走整屏 48 帧波形
- *   （单次 580~700 ms，带一次反相闪屏）。32 章的书刷 20 次，合计 13.1 s 面板时间。
- * WR_PROGRESS_AREA 1 —— 局部档：tick 先把 fb 画好，再返回 APP_REDRAW_AREA，只推进度块
- *   （差分 DU，约 100 ms，无反相）。32 次合计约 3 s，全程不闪；每 16 次补一次 GL16 沉淀。
- * 0 = baseline (full 48-frame page refresh per 5% step, 13.1 s per 32-chapter book).
- * 1 = partial push of the progress box only (diff DU, ~100 ms, no inversion, ~3 s). */
-#ifndef WR_PROGRESS_AREA
-#define WR_PROGRESS_AREA 1
-#endif
-
-/* 基线档的节流依据：上一次真正画进进度条的百分比。必须跟"已画出去的值"比，不能跟上一次
- * tick 的进度比——每章只有 3%，跟上一次比永远跨不过门槛，进度条会一次都不重绘。
- * Baseline throttle reference: the percentage that was actually painted. Comparing against
- * the previous tick never crosses the threshold (a chapter is only ~3%), so the bar would
- * never repaint at all. */
-static unsigned s_drawn_pct;
-#if WR_PROGRESS_AREA
-/* 进度区域：440x24 的进度条（y=482）加居中计数文字（y=542）。只推这一块。
- * 区域高度按"像素行数"直接换成波形帧数：108 行是 20 帧 / 242 ms，压到 84 行约 16 帧。
- * The bar at y=482 plus the centred counter at y=542. The waveform frame count scales with
- * the row count, so 84 rows cost ~16 frames instead of 20. */
-static EpdRect s_progress_area = {112,478,460,84};
-static bool s_progress_pending;     /* 进度已画进 fb，等 present 推上屏 */
-static unsigned s_progress_pushes;  /* 连续 DU 次数，用于周期性 GL16 沉淀 */
-static uint32_t s_progress_ms;      /* 上次推屏时刻，限频用 */
-#endif
 
 #define WR_SESSION_VERIFY_TTL_US (60LL * 1000LL * 1000LL)
 
@@ -99,7 +97,12 @@ static void refresh_shelf(void) {
     for (int i = 0; i < slots; ++i) {
         char path[WR_PATH];
         memset(&s_books[i], 0, sizeof(s_books[i]));
-        s_cached[i] = wr_shelf_get(s_page*slots+i, &s_books[i]) && wr_book_path(&s_books[i], path);
+        s_cache_kind[i] = WR_SHELF_NONE;
+        s_cache_ready[i] = s_cache_total[i] = 0;
+        if (!wr_shelf_get(s_page*slots+i, &s_books[i])) continue;
+        if (wr_book_path(&s_books[i], path)) s_cache_kind[i] = WR_SHELF_FULL; // 整本 EPUB
+        else if (wr_cache_summary(&s_books[i], &s_cache_ready[i], &s_cache_total[i]))
+            s_cache_kind[i] = s_cache_ready[i] >= s_cache_total[i] ? WR_SHELF_FULL : WR_SHELF_PARTIAL;
     }
 }
 
@@ -142,10 +145,15 @@ bool app_weread_confirm_open(app_ctx_t *ctx, const char *path, bool from_home) {
 }
 
 static app_redraw_t start(app_ctx_t *ctx, wr_job_t job) {
-    if (wr_status(NULL, 0, NULL, NULL) == WR_BUSY) {
-        s_message = "请等待当前操作完成";
-        return APP_REDRAW_PAGE;
-    }
+    /*
+     * 不再在这里挡"请等待当前操作完成"：后台预取占着任务时，wr_start 会把用户任务登记
+     * 下来并让预取收手，界面上直接进任务页。只有真正不可插队的情况（例如另一个用户任务
+     * 正在跑）才在 wr_start 里被拒绝，文案也由它给出。
+     * Dropping the "wait for the current operation" guard: when a background prefetch holds the
+     * worker, wr_start parks the user job and makes the prefetch yield, so the UI goes straight
+     * to the task screen. Only genuinely non-preemptable cases (another user job running) are
+     * rejected inside wr_start, which also supplies the message.
+     */
     if (!wr_online()) {
         s_wait_wifi = true;
         s_after_wifi = job;
@@ -156,12 +164,6 @@ static app_redraw_t start(app_ctx_t *ctx, wr_job_t job) {
     s_has_retry = false;
     s_job = job;
     s_done = s_total = 0;
-    s_drawn_pct = 0;
-#if WR_PROGRESS_AREA
-    s_progress_pending = false;
-    s_progress_pushes = 0;
-    s_progress_ms = 0;
-#endif
     s_qr[0] = 0;
     s_view = WORK;
     if (!wr_start(job, &s_selected, s_selected_index, 0)) {
@@ -175,7 +177,15 @@ static void enter(app_ctx_t *ctx) {
     refresh_shelf();
     if (!s_cover_pixels) s_cover_pixels = heap_caps_malloc(BOOK_COVER_W*BOOK_COVER_H,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     if (s_wifi_open) {
-        if (wr_online()) { s_wifi_open = false; open_book(ctx,false); return; }
+        if (wr_online()) {
+            s_wifi_open = false;
+            if (s_open_after_wifi) {
+                s_open_after_wifi = false; s_ask_connect = false; s_view = ACTIONS;
+                (void)open_selected(ctx);
+                return;
+            }
+            open_book(ctx,false); return;
+        }
         s_view = ASK_WIFI;
     } else if (s_wait_wifi) {
         s_wait_wifi = false;
@@ -209,12 +219,21 @@ static app_redraw_t nav_reselect(app_ctx_t *ctx) {
 
 static void leave(app_ctx_t *ctx) {
     (void)ctx;
+    /*
+     * 这两个标记不能在离页时清掉：点"连接 Wi-Fi"会切到传书页去，回来时正是靠它们把刚才那次
+     * 打开补上。它们只在"取消"和"补上之后"两处复位。
+     * These two must survive leaving the page: tapping "connect Wi-Fi" switches to the transfer
+     * app, and they are what lets the interrupted open resume on return. They are cleared only on
+     * cancel, or once the open has been resumed.
+     */
     if (s_view == WORK) { wr_cancel(); s_view = SHELF; }
     free(s_cover_pixels);
     s_cover_pixels = NULL;
 }
 
-static EpdRect action_rect(int i) { return (EpdRect){96, 390+i*99, 492, 76}; }
+// 六个按钮要塞进同一张卡片：70 高、84 行距，最后一个底边仍在卡片内。
+// Six buttons must fit one card: 70 tall with an 84 row pitch keeps the last inside it.
+static EpdRect action_rect(int i) { return (EpdRect){96, 386+i*84, 492, 70}; }
 static EpdRect retry_rect(void) { return (EpdRect){190, 566, 300, 68}; }
 /* 右上控件位置由书架统一给出，两个书架不再各存一份常量。 */
 static EpdRect sync_rect(void) { return app_book_shelf_action_rect(false); }
@@ -242,15 +261,61 @@ static void shelf_title_fit(const char *src, char dst[160], int px, int width) {
         memcpy(dst,"…",sizeof("…"));
 }
 
-static void button(uint8_t *fb, EpdRect r, const char *label, bool enabled) {
+static void button_px(uint8_t *fb, EpdRect r, const char *label, bool enabled, int px) {
     ui_fill_round_rect(fb,r,16,enabled?UI_GRAY_WHITE:0xe0);
     ui_draw_control_frame(fb,r,16,enabled?0x50:0xa0);
-    if (enabled) ui_text_box(fb,(EpdRect){r.x+8,r.y+4,r.width-16,r.height-8},30,label,EPD_DRAW_ALIGN_CENTER,false);
-    else ui_text_fixed_ink_vc(fb,r.x+r.width/2,r.y+r.height/2,ui_text_effective_px(30),label,EPD_DRAW_ALIGN_CENTER,0x80);
+    if (enabled) ui_text_box(fb,(EpdRect){r.x+8,r.y+4,r.width-16,r.height-8},px,label,EPD_DRAW_ALIGN_CENTER,false);
+    else ui_text_fixed_ink_vc(fb,r.x+r.width/2,r.y+r.height/2,ui_text_effective_px(px),label,EPD_DRAW_ALIGN_CENTER,0x80);
+}
+static void button(uint8_t *fb, EpdRect r, const char *label, bool enabled) {
+    button_px(fb,r,label,enabled,30);
+}
+
+/*
+ * 按可用宽度把一段话拆成多行，逐行居中，字号固定不变。
+ * ui_text_box 只画单行：宽度不够时它把字号一路压到能塞下为止——这正是这段说明怎么调都显小
+ * 的原因，写 36 实际画出来只有 17。这里字号给定后不再变，行数随宽度走，系统字号放大时自动
+ * 多排一行，而不是把字缩小。
+ * Split a passage into lines that fit the box, each centred, at a fixed type size. ui_text_box
+ * draws one line and shrinks the type until it fits — which is why this explanation never grew:
+ * asking for 36 produced 17. Here the size is fixed and the line count follows the width, so a
+ * larger system size wraps onto more lines instead of shrinking back down.
+ */
+static void text_block(uint8_t *fb, EpdRect box, int px, const char *text) {
+    if (!fb || !text || !text[0] || box.width <= 0 || box.height <= 0) return;
+    const int size = ui_text_effective_px(px);
+    const int line_h = size + size / 3;
+    int y = box.y;
+    const char *p = text;
+    while (*p && y + line_h <= box.y + box.height) {
+        char line[192];
+        size_t used = 0;
+        const char *q = p;
+        while (*q) {
+            unsigned len = 1;
+            const unsigned char c = (unsigned char)*q;
+            if (c >= 0xf0) len = 4; else if (c >= 0xe0) len = 3; else if (c >= 0xc0) len = 2;
+            if (used + len >= sizeof(line)) break;
+            memcpy(line + used, q, len);
+            line[used + len] = 0;
+            if (ui_text_fixed_width_px(size, line) > box.width) {
+                line[used] = 0; // 这个字符进不去，留到下一行
+                break;
+            }
+            used += len;
+            line[used] = 0;
+            q += len;
+        }
+        if (!used) break;
+        ui_text_fixed_vc(fb, box.x + box.width / 2, y + line_h / 2, size, line,
+                         EPD_DRAW_ALIGN_CENTER, false);
+        y += line_h;
+        p = q;
+    }
 }
 
 static void title(uint8_t *fb, const char *label) {
-    ui_text_box(fb,(EpdRect){36,86,370,70},48,label,EPD_DRAW_ALIGN_LEFT,false);
+    ui_text_box(fb,(EpdRect){36,86,370,70},UI_PX_LABEL,label,EPD_DRAW_ALIGN_LEFT,false);
 }
 
 static void draw_cover(uint8_t *fb, const wr_book_t *book, EpdRect rect) {
@@ -275,7 +340,12 @@ static void shelf(uint8_t *fb) {
     if (slots > WR_SLOTS) slots = WR_SLOTS;
     for (int i = 0; i < slots && s_books[i].id[0]; ++i) {
         EpdRect r = app_book_shelf_slot(i), cover = app_book_shelf_cover(i);
-        const char *cached = s_cached[i] ? "已缓存" : "未缓存";
+        char cache_text[32];
+        if (s_cache_kind[i] == WR_SHELF_FULL) snprintf(cache_text, sizeof(cache_text), "已缓存");
+        else if (s_cache_kind[i] == WR_SHELF_PARTIAL)
+            snprintf(cache_text, sizeof(cache_text), "%u/%u", s_cache_ready[i], s_cache_total[i]);
+        else snprintf(cache_text, sizeof(cache_text), "未缓存");
+        const char *cached = cache_text;
         char short_title[160];
         int title_px=ui_text_effective_px(24);
         if (title_px>30) title_px=30;
@@ -300,28 +370,29 @@ static void shelf(uint8_t *fb) {
 }
 
 static bool action_enabled(int action) {
-    static const bool cache_required[] = {true, false, true, true, false};
-    if (cache_required[action] && !s_selected_cached) return false;
-    return action == 0 || action == 4 || (s_logged && (action != 1 || !s_selected_cached));
-}
-
-/* 进度条与计数文字，单独抽出来给局部刷新复用。
- * The bar and its counter, factored out so the partial refresh can repaint the same pixels. */
-static void draw_progress(uint8_t *fb) {
-    char progress[64];
-    if (s_job == WR_SYNC && !s_total) snprintf(progress,sizeof(progress),"正在连接并获取书架数据…");
-    else if (s_job == WR_SYNC) snprintf(progress,sizeof(progress),"%u / %u 本封面已下载",s_done,s_total);
-    else snprintf(progress,sizeof(progress),"%u / %u",s_done,s_total);
-    EpdRect bar = {122,482,440,24};
-    ui_fill_round_rect(fb,bar,12,0xd8);
-    unsigned pct = !s_total ? 0 : s_done >= s_total ? 100 : (unsigned)(((uint64_t)s_done*100u)/s_total);
-    int fill = (int)((bar.width-4)*pct/100u);
-    if (fill > 0) ui_fill_round_rect(fb,(EpdRect){bar.x+2,bar.y+2,fill,bar.height-4},10,0x50);
-    ui_text_vc(fb,342,542,30,progress,EPD_DRAW_ALIGN_CENTER,false);
+    /* 阅读不再要求整本已缓存：未缓存的书由虚拟书源打开，缺的章节按窗口补齐。
+     * 上传/下载进度同样不再要求缓存：分章缓存的书只有标记文件也能同步，下载到的章节
+     * 若不在本地，会边缓存边打开。
+     * Reading no longer requires a complete cache: an uncached book opens through the virtual
+     * source and fills chapters from the background window. Progress sync drops the same
+     * requirement: a chapter-cached book (only a marker on disk) syncs too, and a downloaded
+     * chapter that is not local yet caches as it opens. */
+    if (action == 1) return s_logged && !s_selected_full;
+    // 0 阅读 / 5 关闭 永远可用；4 删除本地缓存需要登录（要按账号定位文件与缓存）。
+    // 0 read and 5 close are always available; 4 needs an account to locate files and cache.
+    return action == 0 || action == 5 || s_logged;
 }
 
 static void render(app_ctx_t *ctx, uint8_t *fb) {
     (void)ctx;
+    /*
+     * 微读的每一页都走系统字号：标题、按钮、提示、辅助信息都用 ui_text_effective_px，
+     * 读者在系统设置里调大字号，这里跟着变，和设置页、书架保持同一档。
+     * Every WeRead screen follows the system type size: titles, buttons, notices and captions all
+     * pass through ui_text_effective_px, so changing the size in settings moves this screen with
+     * the rest of the system.
+     */
+    ui_text_set_system_scale(true);
     ui_clear_page(fb);
     if ((s_view == SHELF || s_view == ACTIONS) && app_settings_shelf_style() != 5) ui_root_background(fb);
     ui_nav_status(fb);
@@ -334,25 +405,47 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         char stats[96];
         ui_text_vc(fb,342,263,30,logged?"已登录":"未登录",EPD_DRAW_ALIGN_CENTER,false);
         snprintf(stats,sizeof(stats),"今日上报  %u 分 %u 秒",(unsigned)today/60,(unsigned)today%60);
-        ui_text_vc(fb,342,351,27,stats,EPD_DRAW_ALIGN_CENTER,false);
+        ui_text_vc(fb,342,351,28,stats,EPD_DRAW_ALIGN_CENTER,false);
         snprintf(stats,sizeof(stats),"累计上报  %llu 分 %llu 秒",(unsigned long long)(total/60),(unsigned long long)(total%60));
-        ui_text_vc(fb,342,436,27,stats,EPD_DRAW_ALIGN_CENTER,false);
+        ui_text_vc(fb,342,436,28,stats,EPD_DRAW_ALIGN_CENTER,false);
         button(fb,action_rect(2),logged?"退出登录":"扫码登录",true);
         button(fb,action_rect(3),"返回书架",true);
     }
-    if (s_view == ACTIONS || s_view == ASK_WIFI || s_view == LOGOUT) {
+    if (s_view == ACTIONS || s_view == ASK_WIFI || s_view == LOGOUT || s_view == CONFIRM_DEL) {
         EpdRect box = {58,268,568,657};
         ui_fill_round_rect(fb,box,20,UI_GRAY_WHITE);
         ui_draw_control_frame(fb,box,20,0x50);
-        const char *heading = s_view==ASK_WIFI?(s_wifi_open?"正在连接 Wi-Fi…":"是否启用阅读时长上报"):s_view==LOGOUT?"是否保留所有缓存书籍":s_selected.title;
-        ui_text_box(fb,(EpdRect){83,298,518,75},32,heading,EPD_DRAW_ALIGN_CENTER,false);
+        const char *heading = s_view==ASK_WIFI?(s_wifi_open?"正在连接 Wi-Fi…":
+                                                s_ask_connect?"网络未连接，先连 Wi-Fi？":
+                                                "是否启用阅读时长上报"):s_view==LOGOUT?"是否保留所有缓存书籍":s_view==CONFIRM_DEL?"删除本地缓存？":s_selected.title;
+        // 删除确认这件事不可逆：标题与说明都比其它卡片大一档，读者不用凑近看。
+        // Deleting is irreversible, so this card's title and explanation both run one step
+        // larger than the other sheets; nobody should have to lean in to read it.
+        ui_text_box(fb,(EpdRect){83,298,518,75},s_view==CONFIRM_DEL?36:32,heading,
+                    EPD_DRAW_ALIGN_CENTER,false);
         if (s_view == ACTIONS) {
-            static const char *const actions[] = {"阅读书籍","缓存书籍","上传本地进度","下载云端进度","关闭"};
-            for (int i = 0; i < 5; ++i) button(fb,action_rect(i),actions[i],action_enabled(i));
+            static const char *const actions[] = {"阅读书籍","缓存全本书籍","上传本地进度","获取云端进度","删除本地缓存","关闭"};
+            for (int i = 0; i < 6; ++i) button(fb,action_rect(i),actions[i],action_enabled(i));
+        } else if (s_view == ASK_WIFI && s_ask_connect) {
+            // 这张卡片只有一个目的：把网连上再继续；"继续阅读"在这里没有意义（书还没落地）。
+            // One purpose only: get the link up and carry on. "Continue reading" is meaningless
+            // here because the book has not landed yet.
+            text_block(fb,(EpdRect){83,344,518,84},26,
+                       "这本书还没缓存到本地，需要联网才能取到目录。");
+            button(fb,action_rect(0),"连接 Wi-Fi",true);
+            button(fb,action_rect(1),"取消",true);
         } else if (s_view == ASK_WIFI) {
             button(fb,action_rect(0),"启用，连接 Wi-Fi",true);
             button(fb,action_rect(1),"不启用，继续阅读",true);
             button(fb,action_rect(2),"取消",true);
+        } else if (s_view == CONFIRM_DEL) {
+            // 说明文字与标题同一档，并且用能换行的画法：单行控件会把它压回小字。
+            // Same size as the title, drawn with the wrapping helper — the single-line control
+            // would shrink it straight back down.
+            text_block(fb,(EpdRect){83,366,518,214},36,
+                       "将删除本书的章节缓存与本地书架文件，微信读书里的书不受影响。");
+            button_px(fb,action_rect(3),"删除",true,34);
+            button_px(fb,action_rect(4),"取消",true,34);
         } else {
             button(fb,action_rect(0),"保留并退出",true);
             button(fb,action_rect(1),"删除并退出",true);
@@ -361,10 +454,21 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
     }
     if (s_view == WORK) {
         title(fb,"微信读书");
-        static const char *const labels[] = {"请用微信扫码登录","正在同步书架与封面","正在缓存图文","正在上传本地进度","正在下载云端进度","正在上报阅读时长","正在验证登录状态"};
-        ui_text_vc(fb,342,228,29,labels[s_job],EPD_DRAW_ALIGN_CENTER,false);
+        static const char *const labels[] = {"请用微信扫码登录","正在同步书架与封面","正在缓存图文","正在上传本地进度","正在获取云端进度","正在上报阅读时长","正在验证登录状态"};
+        ui_text_vc(fb,342,228,30,labels[s_job],EPD_DRAW_ALIGN_CENTER,false);
         if (s_qr[0]) ui_wifi_qr_draw(fb,(EpdRect){137,300,410,410});
-        if (s_total || s_job == WR_SYNC) draw_progress(fb);
+        if (s_total || s_job == WR_SYNC) {
+            char progress[64];
+            if (s_job == WR_SYNC && !s_total) snprintf(progress,sizeof(progress),"正在连接并获取书架数据…");
+            else if (s_job == WR_SYNC) snprintf(progress,sizeof(progress),"%u / %u 本封面已缓存",s_done,s_total);
+            else snprintf(progress,sizeof(progress),"%u / %u",s_done,s_total);
+            EpdRect bar = {122,482,440,24};
+            ui_fill_round_rect(fb,bar,12,0xd8);
+            unsigned pct = !s_total ? 0 : s_done >= s_total ? 100 : (unsigned)(((uint64_t)s_done*100u)/s_total);
+            int fill = (int)((bar.width-4)*pct/100u);
+            if (fill > 0) ui_fill_round_rect(fb,(EpdRect){bar.x+2,bar.y+2,fill,bar.height-4},10,0x50);
+            ui_text_vc(fb,342,542,30,progress,EPD_DRAW_ALIGN_CENTER,false);
+        }
         button(fb,action_rect(4),"取消",true);
     }
     /* Status messages are modal: keep them off the shelf artwork so covers and
@@ -373,10 +477,9 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         EpdRect notice = {72,430,540,230};
         ui_fill_round_rect(fb,notice,22,UI_GRAY_WHITE);
         ui_draw_control_frame(fb,notice,22,0x50);
-        ui_text_vc(fb,342,s_has_retry?468:480,27,"微信读书",EPD_DRAW_ALIGN_CENTER,false);
+        ui_text_vc(fb,342,s_has_retry?468:480,30,"微信读书",EPD_DRAW_ALIGN_CENTER,false);
         // 失败时留一个重试入口：缓存中断后不必退出弹窗重来。
-        ui_text_box(fb,(EpdRect){104,s_has_retry?496:520,476,s_has_retry?56:64},25,s_message,
-                    EPD_DRAW_ALIGN_CENTER,false);
+        text_block(fb,(EpdRect){104,s_has_retry?486:500,476,s_has_retry?96:110},28,s_message);
         if (s_has_retry) {
             button(fb,retry_rect(),"重试",true);
             ui_text_vc(fb,342,640,18,"轻点其它位置关闭",EPD_DRAW_ALIGN_CENTER,false);
@@ -385,11 +488,25 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         }
     }
     ui_nav_draw(fb,UI_TAB_WEREAD);
+    ui_text_set_system_scale(false);
 }
 
+static app_redraw_t open_selected(app_ctx_t *ctx);
+
 static app_redraw_t tick(app_ctx_t *ctx) {
+    if (s_ask_connect && s_wifi_open && s_view == ASK_WIFI && !wr_online() &&
+        ctx->now_ms - s_wifi_wait_ms > 20000) {
+        s_wifi_open = false;
+        return APP_REDRAW_PAGE;
+    }
     if (s_wifi_open && s_view == ASK_WIFI && wr_online()) {
         s_wifi_open = false;
+        if (s_open_after_wifi) {
+            /* 连上就把刚才那次打开补上：读者点的是"阅读书籍"，不是"去连 Wi-Fi"。
+             * Resume the open that was interrupted: the reader asked to read, not to fix Wi-Fi. */
+            s_open_after_wifi = false; s_ask_connect = false; s_view = ACTIONS;
+            return open_selected(ctx);
+        }
         open_book(ctx,false);
         return APP_REDRAW_NONE;
     }
@@ -425,9 +542,6 @@ static app_redraw_t tick(app_ctx_t *ctx) {
     if (s_view == WORK) {
         if (status != WR_BUSY) {
             ui_wifi_qr_clear();
-#if WR_PROGRESS_AREA
-            s_progress_pending = false;
-#endif
             if (status == WR_OK && s_job == WR_LOGIN) {
                 session_verification_result(status);
                 s_view = ACCOUNT;
@@ -436,6 +550,24 @@ static app_redraw_t tick(app_ctx_t *ctx) {
             }
             session_verification_result(status);
             if (status == WR_OK && s_job == WR_CACHE) book_store_notify_changed();
+            /*
+             * 下载云端进度成功后直接进书并定位到那一章。章节若不在本地，阅读页会先画缓存
+             * 进度卡片，落盘后自动换成正文——"下载进度 → 继续阅读"因此是一条连贯动作，
+             * 不需要用户再回书架点一次。
+             * A successful progress download goes straight into the book at that chapter. If the
+             * chapter is not local yet the reader shows the cache-progress card and swaps in the
+             * text once it lands, so "download progress, keep reading" is one continuous action
+             * instead of a trip back to the shelf.
+             */
+            if (s_job == WR_DOWNLOAD && status == WR_OK) {
+                unsigned target = 0;
+                const bool has_target = wr_progress_take_target(&target);
+                if (has_target) ESP_LOGI(WR_TAG, "cloud progress landed, opening chapter=%u", target + 1);
+                if (has_target && !s_selected_full) {
+                    refresh_shelf();
+                    return open_selected(ctx);
+                }
+            }
             if (s_job == WR_CHECK) {
                 s_view = status == WR_EXPIRED ? ACCOUNT : SHELF;
                 s_message = status == WR_EXPIRED ? "登录已失效，请重新扫码" :
@@ -451,12 +583,6 @@ static app_redraw_t tick(app_ctx_t *ctx) {
                 (s_job == WR_CACHE || s_job == WR_UPLOAD || s_job == WR_DOWNLOAD || s_job == WR_SYNC);
             if (s_has_retry) s_retry_job = s_job;
             refresh_shelf();
-            /* 收尾这一帧必须画出来：跟在这行后面的应该是一次 TPS + EpdTiming。日志里没有，
-             * 就说明重绘请求被上面的门挡住了（见 app_loop.c 的 on_tick gated 告警）。
-             * This frame must actually be presented: a TPS + EpdTiming pair should follow. If it
-             * is missing, the redraw request was gated before reaching on_tick. */
-            ESP_LOGI("WEREAD", "ui work done status=%d job=%d view=%d notice=%d",
-                     (int)status, (int)s_job, (int)s_view, (int)(s_message != NULL));
             return APP_REDRAW_PAGE;
         }
         if (strcmp(qr,s_qr)) {
@@ -464,35 +590,7 @@ static app_redraw_t tick(app_ctx_t *ctx) {
             if (*qr) (void)ui_wifi_qr_prepare_text(qr);
             return APP_REDRAW_PAGE;
         }
-        if (done != s_done || total != s_total) {
-#if WR_PROGRESS_AREA
-            /* 局部档：只推 460x84 的进度区（MODE_DU 差分，约 100 ms、无反相），每章都能跳，
-             * 屏幕全程不闪。250 ms 限频是为了避免同一章的多次 tick 重复推送。
-             * Partial push: only the 460x84 progress box (diff DU, ~100 ms, no inversion), so the
-             * bar can advance on every chapter without flashing. The 250 ms gate just avoids
-             * pushing twice for the same chapter across ticks. */
-            s_done = done;
-            s_total = total;
-            if (ctx->now_ms - s_progress_ms < 250u) return APP_REDRAW_NONE;
-            s_progress_ms = ctx->now_ms;
-            render(ctx, ctx->fb);
-            s_progress_pending = true;
-            return APP_REDRAW_AREA;
-#else
-            /* 基线档（81.5 s 那版）：跨 5% 整屏刷一次，40 章的书约每 6 s 跳一格。收尾那一格
-             * 故意不画——完成分支会连书架带提示一次画完；以前两边都画，两次整屏只隔 63 ms，
-             * 后一帧抢不到面板被丢，屏幕就永久停在进度页。
-             * Baseline: a full refresh per 5% step (about one every 6 s on a 40-chapter book).
-             * The final step is skipped so the completion branch draws shelf + notice in one
-             * uncontested frame; drawing both raced them 63 ms apart and dropped the later one. */
-            const unsigned step = total ? done * 100u / total : 0;
-            s_done = done;
-            s_total = total;
-            if (step < s_drawn_pct + 5u) return APP_REDRAW_NONE;
-            s_drawn_pct = step;
-            return APP_REDRAW_PAGE;
-#endif
-        }
+        if (done != s_done || total != s_total) { s_done=done; s_total=total; return APP_REDRAW_PAGE; }
         return APP_REDRAW_NONE;
     }
     if (status == WR_EXPIRED && s_logged) {
@@ -504,17 +602,115 @@ static app_redraw_t tick(app_ctx_t *ctx) {
     return APP_REDRAW_NONE;
 }
 
+/*
+ * 打开当前选中书籍：整书 EPUB 就绪时按原路径打开，否则先落一份标记文件，由阅读器的
+ * 虚拟书源直接打开，章节在后台按窗口补齐。用户点击即刻进书。阅读与"下载进度后进书"
+ * 共用这一段，避免两套打开逻辑各自演化。
+ * Open the selected book: a complete EPUB still opens as before, otherwise a marker is
+ * written and the reader's virtual source opens the book at once while chapters fill in from
+ * the background window. Reading and "open after downloading progress" share this path so the
+ * two can never drift apart.
+ */
+static app_redraw_t open_selected(app_ctx_t *ctx) {
+    unsigned start_chapter = 0;
+    /* 先顶到书架第一位，和手机上的微信读书一致：返回书架时这本书就该在最前面。
+     * 只改本地索引顺序，不联网；失败不影响打开。 */
+    /* Float it to the top first, as WeRead does on the phone. Local index order only, no
+     * network call, and a failure never blocks opening. */
+    (void)wr_shelf_touch(s_selected.id);
+    /*
+     * 离线且这本书还不在本地书架（没有标记文件，目录也只能从云端取）时，先问要不要连网再继续。
+     * 以前直接去取目录，取不到就把"获取目录失败"丢给读者，而真因是没有网络。已经在书架上、
+     * 目录也缓存过的书照旧离线打开——那是能读的。
+     * Offline and the book is not on the local shelf yet (no marker, TOC only in the cloud): ask
+     * about connecting first. It used to fetch the TOC anyway and hand the reader "TOC fetch
+     * failed" while the real cause was no network. Books already on the shelf with a cached TOC
+     * still open offline — those are readable.
+     */
+    if (!wr_online() && !wr_book_path(&s_selected, s_open)) {
+        s_wait_wifi = false; s_ask_connect = true; s_view = ASK_WIFI;
+        return APP_REDRAW_PAGE;
+    }
+    if (!wr_book_path(&s_selected, s_open) &&
+        !wr_open_book(&s_selected, s_open, &start_chapter)) {
+        s_message = wr_error_message(); // 留在操作菜单里给出原因，不静默回书架
+        s_has_retry = false;
+        s_view = ACTIONS;
+        return APP_REDRAW_PAGE;
+    }
+    // 无论从第几章进入都先把窗口任务拉起来：首章命中缓存时不会读到占位正文，
+    // 也就没有别的机会触发预取。
+    // Start the window job whichever chapter we enter at: when the first chapter is already
+    // cached no placeholder is ever read, so nothing else would trigger prefetching.
+    wr_prefetch_nudge(start_chapter);
+    s_from_home = false;
+    s_back_to_weread = true;
+    if (s_logged && !wr_online()) { s_view = ASK_WIFI; return APP_REDRAW_PAGE; }
+    open_book(ctx, false);
+    return APP_REDRAW_NONE;
+}
+
+/*
+ * 删除本地缓存：章节缓存目录、目录缓存、概况文件、书籍旁的封面快照，以及本地书架上这本书
+ * 的源文件（分章缓存的书就是一个标记文件）。微信读书里的书不受影响，微读封面也保留。
+ * Removing the local cache: chapter tree, TOC cache, summary, the cover snapshot beside the book
+ * and the book's own file on the local shelf (a marker for a chapter-cached book). The book in
+ * WeRead is untouched, and its WeRead cover is kept.
+ */
+static void delete_local_cache(app_ctx_t *ctx) {
+    (void)ctx;
+    char path[WR_PATH] = {0};
+    /*
+     * 这里不能用 wr_book_path：它要求这本书同时"已登记缓存"且"文件存在"，而删除要处理的
+     * 恰恰是这两种残缺状态——只剩章节缓存、书文件已不在，或者缓存概况重排后丢了这一条。
+     * 用它就会报"找不到本地文件"，读者明明看得见这本书的缓存。
+     * wr_book_path must not be used here: it requires both a registered cache entry and an
+     * existing file, while deletion is exactly about the broken cases — only chapters left, the
+     * file already gone, or the entry lost in a shelf reorder. Using it reports "no local file"
+     * for a book whose cache the reader can plainly see.
+     */
+    if (!wr_book_storage(&s_selected, path) || !path[0]) {
+        s_message = "尚未登录微信读书，无法定位本地缓存";
+        s_view = SHELF;
+        refresh_shelf();
+        return;
+    }
+    /* 先停掉这本书的缓存任务：删目录的同时后台还在往里写，可能删不干净或者把书又落回来。
+     * Stop this book's cache jobs first: deleting the tree while the background still writes into
+     * it either leaves debris or lands the chapter again right after the delete. */
+    wr_cache_pause(path);
+    bool removed = false;
+    (void)book_store_delete(path, &removed);
+    const bool cache = wr_forget_book(path);
+    /* 按"实际删到了什么"回话：书文件没了但章节缓存还在，也算清理成功，不能报找不到文件。 */
+    /* Report what was actually removed: with the file gone but chapters still on the card the
+     * cleanup still succeeded, and must not answer "file not found". */
+    s_message = removed ? "已删除本地缓存" : cache ? "缓存已清理" : "这本书本地没有缓存";
+    s_view = SHELF;
+    refresh_shelf();
+}
+
 static app_redraw_t activate(app_ctx_t *ctx,int index) {
     if (s_view == ACTIONS) {
         if (!action_enabled(index)) return APP_REDRAW_NONE;
-        if (index == 4) { s_view = SHELF; return APP_REDRAW_PAGE; }
+        if (index == 5) { s_view = SHELF; return APP_REDRAW_PAGE; }
+        if (index == 4) { s_view = CONFIRM_DEL; return APP_REDRAW_PAGE; }
         if (index != 0) return start(ctx,index==1?WR_CACHE:index==2?WR_UPLOAD:WR_DOWNLOAD);
-        if (!wr_book_path(&s_selected,s_open)) { refresh_shelf(); s_view=SHELF; return APP_REDRAW_PAGE; }
-        s_from_home=false;
-        s_back_to_weread=true;
-        if (s_logged && !wr_online()) { s_view=ASK_WIFI; return APP_REDRAW_PAGE; }
-        open_book(ctx,false);
-        return APP_REDRAW_NONE;
+        return open_selected(ctx);
+    }
+    if (s_view == CONFIRM_DEL) {
+        if (index == 3) { delete_local_cache(ctx); return APP_REDRAW_PAGE; }
+        s_view = SHELF;
+        return APP_REDRAW_PAGE;
+    }
+    if (s_view == ASK_WIFI && s_ask_connect) {
+        if (index == 0) {
+            s_wifi_open = true; s_open_after_wifi = true; s_wifi_wait_ms = ctx->now_ms;
+            connect_wifi(ctx);
+            return APP_REDRAW_NONE;
+        }
+        s_ask_connect = false; s_open_after_wifi = false; s_view = ACTIONS;
+        return APP_REDRAW_PAGE;
     }
     if (s_view == ASK_WIFI) {
         if (index == 0) { s_wifi_open=true; connect_wifi(ctx); return APP_REDRAW_NONE; }
@@ -557,9 +753,17 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *event) {
         if (ui_rect_hit(action_rect(4),x,y)) { wr_cancel(); s_message="正在取消"; return APP_REDRAW_PAGE; }
         return APP_REDRAW_NONE;
     }
-    if (s_view == ACTIONS || s_view == ASK_WIFI || s_view == LOGOUT) {
-        for (int i=0; i<(s_view==ACTIONS?5:3); ++i) if (ui_rect_hit(action_rect(i),x,y)) return activate(ctx,i);
-        return APP_REDRAW_NONE;
+    if (s_view == ACTIONS || s_view == ASK_WIFI || s_view == LOGOUT || s_view == CONFIRM_DEL) {
+        const int count = s_view==ACTIONS?6:s_view==CONFIRM_DEL?5:3;
+        for (int i=0; i<count; ++i) if (ui_rect_hit(action_rect(i),x,y)) return activate(ctx,i);
+        /*
+         * 点到空白处也关掉弹窗。以前只有"关闭"按钮能退出，读者点到卡片外面什么也不会发生，
+         * 看起来就像页面卡住了。
+         * A tap outside closes the sheet as well. Before, only the Close button worked, and a tap
+         * on the card's margins did nothing — the page read as stuck.
+         */
+        if (s_view == ACTIONS || s_view == CONFIRM_DEL) { s_view = SHELF; return APP_REDRAW_PAGE; }
+        return activate(ctx,2);
     }
     int tab=ui_nav_hit(x,y);
     if (tab>=0) { ui_nav_request(ctx,tab); return APP_REDRAW_NONE; }
@@ -590,7 +794,7 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *event) {
     for (int i=0; i<slots && s_books[i].id[0]; ++i) if (ui_rect_hit(app_book_shelf_slot(i),x,y)) {
         s_selected=s_books[i];
         s_selected_index=s_page*slots+i;
-        s_selected_cached=s_cached[i];
+        s_selected_full=s_cache_kind[i] == WR_SHELF_FULL;
         s_view=ACTIONS;
         s_message=NULL;
         return APP_REDRAW_PAGE;
@@ -612,48 +816,11 @@ static void media(app_ctx_t *ctx) { (void)ctx; refresh_shelf(); }
 static void lost(app_ctx_t *ctx) { wr_cancel(); media(ctx); }
 static void locking(app_ctx_t *ctx) { (void)ctx; if (s_view == WORK) wr_cancel(); }
 
-#if WR_PROGRESS_AREA
-/* 进度局部刷新：tick 已经把 fb 画好，这里只负责把进度区推上屏。
- * MODE_DU 没有反相过程，所以缓存全程屏幕不会闪；每 16 次补一次 GL16 沉淀，
- * 把反复 DU 攒下的残影清掉（收尾的整页刷新也会彻底清一次）。
- * Partial progress push: tick already painted fb, so only the progress box goes to the panel.
- * MODE_DU has no inversion phase, so nothing flashes during caching; a GL16 settle every 16
- * pushes clears the residue that repeated DU leaves behind (the final page refresh clears it
- * completely as well). */
-static bool present(app_ctx_t *ctx, app_redraw_t redraw) {
-    if (redraw != APP_REDRAW_AREA) return false;
-    const bool pending = s_progress_pending;
-    s_progress_pending = false;
-    if (!pending || s_view != WORK) return false;
-    /* 每 16 次沉淀一次：GL16 单次 48 帧 / 650 ms，比 DU 贵得多，8 次一沉淀等于每轮多花
-     * 2.6 s；收尾的整页刷新本来就会把残影彻底清掉，中途只需要压一次。 */
-    /* Settle every 16 pushes: one GL16 costs 48 frames / 650 ms, far more than a DU, so
-     * settling every 8 added 2.6 s per run. The final page refresh clears the residue
-     * anyway, so one mid-run settle is enough. */
-    const bool settle = ++s_progress_pushes % 16u == 0;
-    /* 差分推送：进度条只增长、数字只变几位，整块推 20 帧 / 242 ms，差分只剩改动的那几行。
-     * Diff push: the bar only grows and a couple of digits change, so a whole-box push costs
-     * 20 frames / 242 ms while a diff only carries the rows that actually changed. */
-    guard_draw_result(ctx->hl, settle
-        ? update_display_area_with(ctx->hl, &E0470_WAVEFORM, MODE_GL16, s_progress_area)
-        : update_display_area_diff_with(ctx->hl, &E0470_WAVEFORM, MODE_DU, s_progress_area));
-    return true;
-}
-
-static EpdRect area_hint(app_ctx_t *ctx) {
-    (void)ctx;
-    return s_progress_area;
-}
-#endif
-
 const app_desc_t app_weread = {
     .title="微信读书", .detail="微信读书书架", .enter_full=true,
     .persistent_navigation=true, .navigation_visible=navigation, .navigation_enabled=navigation,
     .main_page_visible=root,
     .on_enter=enter, .on_exit=leave, .on_tick=tick, .render=render,
-#if WR_PROGRESS_AREA
-    .present=present, .area_hint=area_hint,
-#endif
     .on_nav_reselect=nav_reselect,
     .on_gesture=gesture, .on_key=key, .on_media_lost=lost, .on_media_ready=media,
     .on_before_lock=locking,

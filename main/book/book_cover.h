@@ -7,6 +7,10 @@
 #define BOOK_COVER_H 240
 
 // Output is one grayscale byte per pixel (0=black, 255=white).
+/// 逐章缓存的书把封面放在书旁的 <路径>.gray；供不经解码队列的调用方直接读取。
+/// Chapter-cached books keep their artwork beside the book; callers outside the decode queue
+/// read it directly.
+bool book_cover_sidecar_gray(const char *path, uint8_t out[BOOK_COVER_W * BOOK_COVER_H]);
 bool book_cover_thumbnail(const uint8_t *data, size_t size, bool png,
                           uint8_t out[BOOK_COVER_W * BOOK_COVER_H]);
 // Decode an image to a chosen grayscale size; output is one byte per pixel.

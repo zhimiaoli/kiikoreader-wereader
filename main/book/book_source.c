@@ -6,6 +6,7 @@
  * Frozen: TXT retains source offsets; EPUB uses cumulative spine HTML bytes; retain plain-text loading; only source-validated derived chapter summaries may be written, never books or progress.
  */
 #include "book_source_internal.h"
+#include "book_chapter_cache.h"
 #include "book_epub.h"
 #include "book_index_cache.h"
 #include <sys/stat.h>
@@ -18,6 +19,38 @@
 #endif
 static book_txt_t s_book;
 static book_epub_t *s_epub;
+static book_virtual_resolver_t s_resolver;
+void book_set_virtual_resolver(book_virtual_resolver_t resolver) { s_resolver = resolver; }
+
+/*
+ * 逐章缓存书源（微信读书）的状态查询实现由注册方提供；本文件只记住"当前这本书是不是
+ * 由虚拟书源打开的"，从而保证普通 EPUB/TXT 永远不会看到别人的缓存状态。
+ * The registrant supplies the chapter-cache queries; this file only remembers whether the book
+ * currently open came from a virtual source, so plain EPUB/TXT never see someone else's state.
+ */
+static const book_chapter_cache_ops_t *s_chapter_cache;
+static bool s_chapter_cache_virtual;
+void book_set_chapter_cache_ops(const book_chapter_cache_ops_t *ops) { s_chapter_cache = ops; }
+bool book_chapter_cache_active(void) { return s_chapter_cache && s_chapter_cache_virtual; }
+book_ch_cache_t book_chapter_cache_state(size_t chapter) {
+    return book_chapter_cache_active() && s_chapter_cache->state ? s_chapter_cache->state(chapter)
+                                                                : BOOK_CH_CACHE_UNKNOWN;
+}
+bool book_chapter_cache_request(size_t chapter) {
+    return book_chapter_cache_active() && s_chapter_cache->request
+        ? s_chapter_cache->request(chapter) : false;
+}
+bool book_chapter_cache_refresh(size_t chapter) {
+    return book_chapter_cache_active() && s_chapter_cache->refresh
+        ? s_chapter_cache->refresh(chapter) : false;
+}
+unsigned book_chapter_cache_epoch(void) {
+    return book_chapter_cache_active() && s_chapter_cache->epoch ? s_chapter_cache->epoch() : 0;
+}
+bool book_chapter_cache_progress(unsigned *done, unsigned *total, unsigned *percent) {
+    return book_chapter_cache_active() && s_chapter_cache->progress
+        ? s_chapter_cache->progress(done, total, percent) : false;
+}
 #if KIIKO_BOARD_METALIO47
 static char s_io_path[512];
 static bool s_io_suspended;
@@ -68,6 +101,21 @@ esp_err_t book_open(const char *path) {
 #endif
     const char *ext = strrchr(path, '.');
     if (ext && !strcasecmp(ext, ".epub")) {
+        // 先问虚拟解析器：逐章缓存的微信读书书在磁盘上只有占位标记，不是完整 EPUB。
+        // 解析器只认自己的标记，认不出就退回普通 ZIP 打开，旧缓存书行为不变。
+        // Ask the virtual resolver first: a chapter-cached WeRead book is only a placeholder on
+        // disk. The resolver recognises its own marker and otherwise declines, so legacy cached
+        // books keep opening through the normal ZIP path.
+        if (s_resolver) {
+            book_epub_virtual_t src;
+            memset(&src, 0, sizeof(src));
+            if (s_resolver(path, &src)) {
+                esp_err_t verr = book_epub_open_virtual(&src, &s_epub);
+                if (verr != ESP_OK) book_close();
+                else s_chapter_cache_virtual = true;
+                return verr;
+            }
+        }
         esp_err_t err=book_epub_open(path,&s_epub);if(err==ESP_OK)chapter_summary_opened(path);return err;
     }
     if (!ext || strcasecmp(ext, ".txt")) return ESP_ERR_NOT_SUPPORTED;
@@ -77,6 +125,7 @@ esp_err_t book_open(const char *path) {
     return err;
 }
 void book_close(void) {
+    s_chapter_cache_virtual = false;
 #if KIIKO_BOARD_METALIO47
     s_io_suspended = false; s_io_path[0] = 0;
 #else

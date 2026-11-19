@@ -215,6 +215,19 @@ def build_one(board, args):
                # We do not rely on the interactive hints in this automated builder.
                '--no-hints', 'reconfigure', 'build']
     early_key=board=='metalio47' and getattr(args,'s31_early_power_key',False)
+    # 中文：Windows 上默认按 CPU 数并发（本机20）时，偶发 cc1 进程卡在阻塞读取上永不返回，
+    # ninja 会一直等待。限制并发可稳定复现构建；用 --jobs 或 KIIKO_BUILD_JOBS 覆盖。
+    # English: on Windows the default CPU-count parallelism occasionally leaves a cc1 child blocked
+    # forever, stalling ninja. Capping concurrency makes builds reproducible; override with --jobs
+    # or KIIKO_BUILD_JOBS.
+    jobs = getattr(args, 'jobs', None)
+    if not jobs:
+        try:
+            jobs = int(os.environ.get('KIIKO_BUILD_JOBS', '') or 0) or None
+        except ValueError:
+            jobs = None
+    if jobs:
+        command[2:2] = ['-j', str(jobs)]
     if board=='metalio47':
         for index,value in enumerate(command):
             if value.startswith('-DSDKCONFIG_DEFAULTS='):
@@ -303,6 +316,7 @@ def main():
         parser.add_argument('--idf-' + board, dest='idf_' + board)
         parser.add_argument('--managed-' + board, dest='managed_' + board, type=Path)
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--jobs', type=int, help='Parallel compile jobs passed to ninja; mainly to stabilize Windows builds')
     parser.add_argument('--list', action='store_true')
     parser.add_argument('--s31-pie', action='store_true', help='Explicit local S31 PIE experiment; normal builds stay C')
     parser.add_argument('--s31-text-ripple', action='store_true', help='Explicit local S31 four-level text-ripple experiment; ordinary builds remain full grayscale')
